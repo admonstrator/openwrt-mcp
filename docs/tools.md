@@ -198,19 +198,32 @@ Details and limits:
   whose content changed); opkg has no file hashes and says so.
 - `logs` passes every line through `redact`. `file` must resolve to a file under
   `/tmp/log` or `/var/log`.
-- `kernel_modules` flags a loaded module whose `.ko` under `/lib/modules/<release>` is
+- `kernel_modules` prints the taint and a "Flagged" section first, then the module
+  list and the boot lists. It flags a loaded module whose `.ko` under `/lib/modules/<release>` is
   not in the image, and `/etc/modules.d` entries not in the image. Taint bits are decoded;
   `O` (out-of-tree) is normal on OpenWrt.
 - `uci` never sets or commits. `package` may be `pkg` or `pkg.section[.option]`.
-- `network` prints `ip -d addr` when the `ip` supports `-d` (ip-full), else busybox
-  `ip addr` with a note. The netifd table falls back to uci `network` when ubus is not
+- `network` with the default `section=all` is a compact overview (about 12 KB on a router
+  with 35 devices): one line per device with state, type, parent, bridge master and
+  addresses; the netifd table; the main routing table (IPv6 without link-local routes)
+  plus route counts per other table and the number of policy rules; neighbour counts per
+  device; resolvers, dnsmasq upstreams and overrides (first 25); DHCPv4 leases (first 30);
+  radios and SSIDs from uci (no keys); WireGuard interfaces with peer count and latest
+  handshake, VPN processes and config paths. Each part names the section with the full
+  details. `section=interfaces` prints `ip -d addr` when the `ip` supports `-d`
+  (ip-full), else busybox `ip addr` with a note; `routes` prints
+  `ip -4/-6 route show table all` and the rules. The netifd table falls back to uci `network` when ubus is not
   reachable. WireGuard: `wg show all` (keys shown as "(hidden)" by wg, then `redact`) and
-  uci peers without private or preshared keys.
+  uci peers (proto wireguard, and GL.iNet's wgclient/wgserver) without private or
+  preshared keys. dnsmasq config files are listed once by their real path (`/var` is a
+  link to `/tmp`).
 - `connections`: a listener is "all IPv4 addresses" (`0.0.0.0`), "all addresses" (`::`,
   dual stack unless v6only), "loopback only", "interface IF" (address found in `ip addr`)
   or "address on no interface". PID `-` means a kernel socket or an owner that is gone.
   Reachability ignores the firewall. Conntrack top lists are capped at 25 entries each.
-- `firewall`: WAN zones are zones named `*wan*`, masquerading, or holding network
+- `firewall` prints what is exposed first (zones, forwardings, WAN-input accepts, port
+  forwards, includes), then all rules, UPnP, custom rule files and the active ruleset.
+  WAN zones are zones named `*wan*`, masquerading, or holding network
   `wan`. "Rules accepting input from a WAN zone" are enabled or disabled `rule` sections
   with a WAN `src`, no `dest` and target ACCEPT. The ruleset is capped at 300 lines per
   command unless `raw=true`.

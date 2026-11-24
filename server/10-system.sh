@@ -693,33 +693,6 @@ tool_kernel_modules() {
 		find "$_md" -xdev -name '*.ko' 2>/dev/null >ko.txt
 		[ "$_romok" = 1 ] && find "$(rom_path "$_md")" -xdev -name '*.ko' 2>/dev/null | sed "s|^${MCP_ROM%/}||" >romko.txt
 	fi
-	section "Loaded modules"
-	if [ ! -d "$_md" ]; then
-		echo "note: no $_md for the running kernel $_rel (/lib/modules has: $(cd /lib/modules 2>/dev/null && echo *)): container, or kernel and userland do not match"
-	fi
-	[ "$_romok" = 1 ] || echo "note: firmware image not usable, .ko files are not checked against it"
-	if [ ! -r /proc/modules ]; then
-		echo "/proc/modules: not available (kernel without module support?)"
-	else
-		ROMOK=$_romok awk '
-		FILENAME == "ko.txt" { b = $0; sub(/.*\//, "", b); sub(/\.ko$/, "", b); gsub(/-/, "_", b); ko[b] = $0; next }
-		FILENAME == "romko.txt" { rom[$0] = 1; next }
-		{
-			n++; users = $4; if (users == "-") users = ""; sub(/,$/, "", users)
-			taint = ""; if (match($0, /\([A-Z]+\)$/)) taint = substr($0, RSTART + 1, RLENGTH - 2)
-			note = ""
-			if ($1 in ko) {
-				if (ENVIRON["ROMOK"] == 1 && !(ko[$1] in rom)) note = "!! " ko[$1] " not in firmware image"
-			} else note = "no .ko on disk (built in, or loaded from elsewhere)"
-			line[n] = sprintf("%-24s %9s %4s %-6s %-8s %-28s %s", $1, $2, $3, taint, $5, users, note)
-		}
-		END {
-			printf "%d modules\n", n
-			printf "%-24s %9s %4s %-6s %-8s %-28s %s\n", "NAME", "SIZE_B", "USED", "TAINT", "STATE", "USED_BY", "NOTE"
-			for (i = 1; i <= n; i++) print line[i]
-		}' ko.txt romko.txt /proc/modules
-	fi
-
 	section "Kernel taint"
 	_t=$(rd /proc/sys/kernel/tainted)
 	echo "value ${_t:-unreadable}"
@@ -730,16 +703,56 @@ tool_kernel_modules() {
 		if (and(t, 4096)) print "note: O is normal on OpenWrt (many drivers, e.g. wireless and vendor drivers, are built out of tree)"
 	}'
 
-	section "Boot module lists (/etc/modules.d, /etc/modules-boot.d)"
-	_any=0
-	for _f in /etc/modules.d/* /etc/modules-boot.d/*; do
-		[ -e "$_f" ] || [ -L "$_f" ] || continue
-		_any=1
-		_n=
-		[ "$_romok" = 1 ] && ! in_rom "$_f" && _n="   !! not in firmware image"
-		printf '%-40s %s%s\n' "$_f" "$(rd "$_f" | grep -v -E '^[[:space:]]*(#|$)' | head -n 20 | tr '\n' ' ' | sed 's/ $//')" "$_n"
-	done
-	[ "$_any" = 1 ] || echo "none"
+
+	# the long lists go to files first so the flagged entries can lead
+	{
+		section "Loaded modules"
+		if [ ! -d "$_md" ]; then
+			echo "note: no $_md for the running kernel $_rel (/lib/modules has: $(cd /lib/modules 2>/dev/null && echo *)): container, or kernel and userland do not match"
+		fi
+		[ "$_romok" = 1 ] || echo "note: firmware image not usable, .ko files are not checked against it"
+		if [ ! -r /proc/modules ]; then
+			echo "/proc/modules: not available (kernel without module support?)"
+		else
+			ROMOK=$_romok awk '
+			FILENAME == "ko.txt" { b = $0; sub(/.*\//, "", b); sub(/\.ko$/, "", b); gsub(/-/, "_", b); ko[b] = $0; next }
+			FILENAME == "romko.txt" { rom[$0] = 1; next }
+			{
+				n++; users = $4; if (users == "-") users = ""; sub(/,$/, "", users)
+				taint = ""; if (match($0, /\([A-Z]+\)$/)) taint = substr($0, RSTART + 1, RLENGTH - 2)
+				note = ""
+				if ($1 in ko) {
+					if (ENVIRON["ROMOK"] == 1 && !(ko[$1] in rom)) note = "!! " ko[$1] " not in firmware image"
+				} else note = "no .ko on disk (built in, or loaded from elsewhere)"
+				line[n] = sprintf("%-24s %9s %4s %-6s %-8s %-28s %s", $1, $2, $3, taint, $5, users, note)
+			}
+			END {
+				printf "%d modules\n", n
+				printf "%-24s %9s %4s %-6s %-8s %-28s %s\n", "NAME", "SIZE_B", "USED", "TAINT", "STATE", "USED_BY", "NOTE"
+				for (i = 1; i <= n; i++) print line[i]
+			}' ko.txt romko.txt /proc/modules
+		fi
+	} >mods.txt
+	{
+		section "Boot module lists (/etc/modules.d, /etc/modules-boot.d)"
+		_any=0
+		for _f in /etc/modules.d/* /etc/modules-boot.d/*; do
+			[ -e "$_f" ] || [ -L "$_f" ] || continue
+			_any=1
+			_n=
+			[ "$_romok" = 1 ] && ! in_rom "$_f" && _n="   !! not in firmware image"
+			printf '%-40s %s%s\n' "$_f" "$(rd "$_f" | grep -v -E '^[[:space:]]*(#|$)' | head -n 20 | tr '\n' ' ' | sed 's/ $//')" "$_n"
+		done
+		[ "$_any" = 1 ] || echo "none"
+	} >boot.txt
+
+	section "Flagged (not in the firmware image)"
+	if [ "$_romok" = 1 ]; then
+		grep -h '!!' mods.txt boot.txt || echo "none"
+	else
+		echo "not checked: firmware image at $MCP_ROM not usable"
+	fi
+	cat mods.txt boot.txt
 	return 0
 }
 

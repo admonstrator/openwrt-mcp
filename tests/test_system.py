@@ -277,8 +277,10 @@ class TestLogs(OpenWrtTestCase):
 class TestKernelModules(OpenWrtTestCase):
     def test_runs(self):
         text = self.tool_ok("kernel_modules")
-        for head in ("== Loaded modules", "== Kernel taint", "== Boot module lists"):
+        heads = ("== Kernel taint", "== Flagged", "== Loaded modules", "== Boot module lists")
+        for head in heads:
             self.assertIn(head, text)
+        self.assertEqual([text.index(h) for h in heads], sorted(text.index(h) for h in heads))
         self.assertRegex(text, r"value \d+")
 
     @needs_container
@@ -295,6 +297,9 @@ class TestKernelModules(OpenWrtTestCase):
                 f"echo x > /lib/modules/{rel}/extra/{mod}.ko && echo m > /etc/modules.d/99-test-{mod}")
         text = self.tool_ok("kernel_modules", env={"MCP_ROM": "/fixture/rom"})
         self.assertRegex(text, rf"\n{mod}\s.*!! /lib/modules/{re.escape(rel)}/extra/{mod}.ko not in firmware image")
+        flagged = text[text.index("== Flagged"):text.index("== Loaded modules")]
+        self.assertIn(f"{mod}.ko not in firmware image", flagged)
+        self.assertIn(f"99-test-{mod}", flagged)
         self.assertRegex(text, rf"/etc/modules.d/99-test-{mod}\s+m\s+!! not in firmware image")
         self.sh(f"rm -rf /lib/modules/{rel} /etc/modules.d/99-test-{mod}")
 

@@ -19,6 +19,18 @@ _net_running() {
 	RE=$1 awk -F '\t' '$7 == 0 && $8 ~ ENVIRON["RE"] { printf "  pid %-6s %-16s %s\n", $1, $8, substr($10, 1, 300); n++ } END { if (!n) print "  none running" }' procs.tsv
 }
 
+# dnsmasq config files, each once (/var is a link to /tmp on OpenWrt)
+_net_dnsmasq_files() {
+	_seen=
+	for _f in /var/etc/dnsmasq.conf* /tmp/etc/dnsmasq.conf* /etc/dnsmasq.conf /tmp/dnsmasq.d/* /tmp/dnsmasq.cfg*.d/* /etc/dnsmasq.d/*; do
+		[ -f "$_f" ] || continue
+		_r=$(readlink -f "$_f" 2>/dev/null) || _r=$_f
+		case " $_seen " in *" $_r "*) continue ;; esac
+		_seen="$_seen $_r"
+		printf '%s\n' "$_r"
+	done
+}
+
 # list files under the given paths with size, mtime and a flag when not in the image
 _net_files() {
 	_romok=0
@@ -41,7 +53,7 @@ _net_files() {
 
 # ============================================================== network
 mcp_register network <<'EOF'
-{"name":"network","title":"Network configuration","description":"The router's network state: interfaces and addresses, bridges and VLANs, netifd's view of the logical interfaces (proto, device, addresses, gateway, DNS), all routing tables and policy rules for IPv4 and IPv6, neighbours, DNS resolvers and dnsmasq settings (upstream servers, address overrides, hosts files), DHCP leases, Wi-Fi status and config (keys masked), and VPNs (WireGuard, OpenVPN, Tailscale, ZeroTier). Use section to fetch one part when the whole is too long.","inputSchema":{"type":"object","properties":{"section":{"type":"string","enum":["all","interfaces","routes","neighbors","dns","dhcp","wifi","vpn"],"description":"Which part to show. Default all.","default":"all"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"network","title":"Network configuration","description":"The router's network state: interfaces and addresses, bridges and VLANs, netifd's view of the logical interfaces (proto, device, addresses, gateway, DNS), all routing tables and policy rules for IPv4 and IPv6, neighbours, DNS resolvers and dnsmasq settings (upstream servers, address overrides, hosts files), DHCP leases, Wi-Fi status and config (keys masked), and VPNs (WireGuard, OpenVPN, Tailscale, ZeroTier). The default section=all is a compact overview (one line per interface, main routing table, condensed DNS, DHCP, Wi-Fi and VPN); request a section for the full details.","inputSchema":{"type":"object","properties":{"section":{"type":"string","enum":["all","interfaces","routes","neighbors","dns","dhcp","wifi","vpn"],"description":"all: compact overview of everything (default). interfaces: ip -d addr, device types, bridges, VLANs, netifd. routes: all tables and policy rules. neighbors, dns, dhcp, wifi (full uci wireless), vpn: the full details of that part.","default":"all"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_network() {
 	arg _sec section all
@@ -49,11 +61,153 @@ tool_network() {
 	all | interfaces | routes | neighbors | dns | dhcp | wifi | vpn) ;;
 	*) tool_error "section must be one of all, interfaces, routes, neighbors, dns, dhcp, wifi, vpn; got '$_sec'"; return 1 ;;
 	esac
-	for _s in interfaces routes neighbors dns dhcp wifi vpn; do
-		[ "$_sec" = all ] || [ "$_sec" = "$_s" ] || continue
-		"_net_$_s"
-	done
+	if [ "$_sec" = all ]; then _net_overview; else "_net_$_sec"; fi
 	return 0
+}
+
+# section=all: one compact pass over everything, each part pointing to its section
+_net_overview() {
+	echo "Compact overview. Full details per part: section=interfaces (ip -d addr, bridges, VLANs), routes (all tables, rules), neighbors, dns, dhcp, wifi (full uci wireless), vpn."
+
+	section "Interfaces (one line per device; details: section=interfaces)"
+	for _i in /sys/class/net/*; do
+		[ -d "$_i" ] || continue
+		_t=$(sed -n 's/^DEVTYPE=//p' "$_i/uevent" 2>/dev/null)
+		[ -e "$_i/tun_flags" ] && _t=tun/tap
+		[ -d "$_i/bridge" ] && _t=bridge
+		[ -z "$_t" ] && [ -e "$_i/phy80211" ] && _t=wlan
+		_m=
+		[ -e "$_i/master" ] && _m=$(readlink "$_i/master" 2>/dev/null | sed 's|.*/||')
+		printf 'D\t%s\t%s\t%s\n' "${_i##*/}" "${_t:--}" "${_m:--}"
+	done >devs.txt
+	ip addr show >ipa.txt 2>&1
+	awk -F '\t' '
+	FILENAME == "devs.txt" { typ[$2] = $3; mst[$2] = $4; next }
+	/^[0-9]+: / {
+		split($0, h, " "); nm = h[2]; sub(/:$/, "", nm); par = ""
+		if (index(nm, "@")) { par = substr(nm, index(nm, "@") + 1); nm = substr(nm, 1, index(nm, "@") - 1) }
+		if (par == "NONE") par = ""
+		st = "?"; for (i = 1; i < length(h); i++) if (h[i] == "state") st = h[i + 1]
+		if (h[3] !~ /[<,]UP[,>]/) st = "admin-down"
+		o[++n] = nm; state[nm] = st; parent[nm] = par; next
+	}
+	{
+		split($0, f, " ")
+		if (f[1] == "inet" || f[1] == "inet6") {
+			if (f[2] ~ /^fe80:/) ll[nm]++
+			else addr[nm] = addr[nm] "" (addr[nm] == "" ? "" : " ") f[2]
+		}
+	}
+	END {
+		printf "%-16s %-14s %-16s %-10s %s\n", "DEVICE", "STATE", "TYPE", "MASTER", "ADDRESSES"
+		for (i = 1; i <= n; i++) {
+			d = o[i]; t = (d in typ) ? typ[d] : "-"; if (parent[d] != "") t = t "@" parent[d]
+			a = addr[d]; if (ll[d]) a = a "" (a == "" ? "" : " ") "(+" ll[d] " link-local)"
+			printf "%-16s %-14s %-16s %-10s %s\n", d, state[d], t, ((d in mst) ? mst[d] : "-"), (a == "" ? "-" : a)
+		}
+		if (!n) print "ip addr: no output"
+	}' devs.txt ipa.txt
+
+	_net_netifd
+
+	section "Routes, main table (all tables and policy rules: section=routes)"
+	echo "IPv4:"
+	ip -4 route show 2>&1 | head -n 60 | sed 's/^/  /'
+	echo "IPv6 (link-local fe80:: routes left out):"
+	ip -6 route show 2>&1 | grep -v -E '^(unreachable )?fe80:' | head -n 60 | sed 's/^/  /'
+	{ ip -4 route show table all; ip -6 route show table all; } 2>/dev/null | awk '
+		{ t = "main"; for (i = 1; i < NF; i++) if ($i == "table") t = $(i + 1); if (t != "main") c[t]++ }
+		END { s = ""; for (k in c) s = s " " k "=" c[k]; print "other tables (routes, IPv4+IPv6):" (s == "" ? " none" : s) }'
+	_r=$(ip -4 rule show 2>/dev/null | grep -c -v -E 'lookup (local|main|default) *$')
+	echo "policy rules besides local/main/default (IPv4): ${_r:-not available}"
+
+	section "Neighbours (entries per device; list: section=neighbors)"
+	ip neigh show 2>/dev/null | awk '
+		{ d = "?"; for (i = 1; i < NF; i++) if ($i == "dev") d = $(i + 1); s = $NF; n[d]++; st[d, s]++; if (!(s in seen)) { seen[s] = 1; ss[++m] = s } }
+		END {
+			for (d in n) { l = sprintf("%-16s %4d", d, n[d]); for (j = 1; j <= m; j++) if ((d, ss[j]) in st) l = l " " ss[j] "=" st[d, ss[j]]; print l; any = 1 }
+			if (!any) print "none"
+		}'
+
+	section "DNS (details: section=dns)"
+	for _f in /etc/resolv.conf /tmp/resolv.conf /tmp/resolv.conf.auto /tmp/resolv.conf.d/resolv.conf.auto; do
+		[ -f "$_f" ] || continue
+		printf '%-40s %s\n' "$_f" "$(rd "$_f" | awk '$1 == "nameserver" || $1 == "search" { printf "%s ", $0 }')"
+	done
+	echo "dnsmasq processes:"
+	_net_running '^dnsmasq$' | head -n 3
+	echo "dnsmasq upstreams and overrides:"
+	_net_dnsmasq_files | while IFS= read -r _f; do
+		rd "$_f" | grep -E '^[[:space:]]*(server|address|conf-dir|conf-file|addn-hosts|resolv-file|servers-file)=' | sed "s|^|  $_f: |"
+	done >dnsov.txt
+	head -n 25 dnsov.txt
+	_n=$(wc -l <dnsov.txt)
+	[ "$_n" -gt 25 ] && echo "  ... $_n lines in total, first 25 shown; section=dns lists them per file"
+	_h=$(rd /etc/hosts | grep -c -v -E '^[[:space:]]*(#|$)')
+	_x=$(cat /tmp/hosts/* 2>/dev/null | grep -c -v -E '^[[:space:]]*(#|$)')
+	echo "hosts entries: /etc/hosts ${_h:-0}, /tmp/hosts/* ${_x:-0}"
+
+	section "DHCP (details: section=dhcp)"
+	_lf=$(lib_uci_dump dhcp | awk -F '\t' '$1 == "O" && $3 == "leasefile" { print $4; exit }')
+	_lf=${_lf:-/tmp/dhcp.leases}
+	if [ -f "$_lf" ]; then
+		rd "$_lf" | awk '{ n++; if (n <= 30) printf "  %-19s %-17s %-15s %s\n", ($1 == 0 ? "never" : strftime("%Y-%m-%d %H:%M:%S", $1)), $2, $3, $4 }
+			END { printf "%d DHCPv4 leases in %s%s\n", n, lf, (n > 30 ? " (first 30 shown)" : "") }' lf="$_lf"
+	else
+		echo "no DHCPv4 lease file ($_lf)"
+	fi
+	lib_uci_dump dhcp | awk -F '\t' '$1 == "S" && $3 == "host" { h++ } $1 == "S" && $3 == "dhcp" { d++ } END { printf "uci dhcp: %d DHCP pools, %d static leases\n", d, h }'
+
+	section "Wi-Fi (radios and SSIDs from uci, keys never shown; details: section=wifi)"
+	lib_uci_dump wireless >wl.uci
+	if [ -s wl.uci ]; then
+		awk -F '\t' '
+		$1 == "S" { t[$2] = $3; o[++n] = $2; next }
+		$3 ~ /^(type|band|hwmode|channel|htmode|disabled|device|mode|ssid|encryption|network|hidden|isolate|ifname)$/ { if (($2, $3) in v) v[$2, $3] = v[$2, $3] "," $4; else v[$2, $3] = $4 }
+		function g(s, k) { return ((s, k) in v) ? v[s, k] : "-" }
+		END {
+			for (i = 1; i <= n; i++) { s = o[i]; if (t[s] == "wifi-device") printf "radio %-14s type=%s band=%s channel=%s htmode=%s disabled=%s\n", s, g(s, "type"), (g(s, "band") != "-" ? g(s, "band") : g(s, "hwmode")), g(s, "channel"), g(s, "htmode"), g(s, "disabled") }
+			for (i = 1; i <= n; i++) { s = o[i]; if (t[s] == "wifi-iface") printf "ssid  %-14s device=%s mode=%s ssid=\"%s\" encryption=%s network=%s disabled=%s hidden=%s\n", s, g(s, "device"), g(s, "mode"), g(s, "ssid"), g(s, "encryption"), g(s, "network"), g(s, "disabled"), g(s, "hidden") }
+		}' wl.uci
+	else
+		echo "no /etc/config/wireless"
+	fi
+	if have iwinfo; then
+		run_timeout 15 iwinfo >iw.txt 2>&1
+		awk '/^[^ \t]/ && /ESSID/ { d = $1; o[++n] = d; e = $0; sub(/.*ESSID: /, "", e); es[d] = e }
+			/Mode:/ { m = $0; sub(/^[ \t]*/, "", m); gsub(/  +/, " ", m); mode[d] = m }
+			/Encryption:/ { c = $0; sub(/.*Encryption: /, "", c); enc[d] = c }
+			END { for (i = 1; i <= n; i++) printf "live  %-14s %s %s enc=%s\n", o[i], es[o[i]], mode[o[i]], enc[o[i]]; if (!n) print "iwinfo: no wireless interfaces" }' iw.txt
+	else
+		echo "iwinfo: not available"
+	fi
+
+	section "VPN (details: section=vpn)"
+	if have wg; then
+		run_timeout 10 wg show interfaces >wgi.txt 2>&1
+		if [ -s wgi.txt ]; then
+			awk '{ for (i = 1; i <= NF; i++) print $i }' wgi.txt >wgn.txt
+			while IFS= read -r _w; do
+				run_timeout 10 wg show "$_w" latest-handshakes >wgh.txt 2>/dev/null
+				run_timeout 10 wg show "$_w" listen-port >wgp.txt 2>/dev/null
+				awk -v w="$_w" -v port="$(cat wgp.txt)" -v now="$(date +%s)" '
+					{ n++; if ($2 > last) last = $2 }
+					END { printf "wireguard %-12s listen_port=%s peers=%d latest_handshake=%s\n", w, (port == "" ? "-" : port), n, (last > 0 ? (now - last) " s ago" : "never") }' wgh.txt
+			done <wgn.txt
+		else
+			echo "wireguard: no interfaces"
+		fi
+	else
+		echo "wg: not available"
+	fi
+	lib_uci_dump network | awk -F '\t' '$3 == "proto" && $4 ~ /^(wireguard|wgclient|wgserver|openvpn|zerotier|tailscale)$/ { s = s " " $2 "(" $4 ")" } END { print "uci VPN interfaces:" (s == "" ? " none" : s) }'
+	_net_procs
+	awk -F '\t' '$7 == 0 && $8 ~ /^(openvpn|tailscaled|tailscale|zerotier-one|wireguard-go|ipsec|charon|xl2tpd)$/ { s = s " " $8 "(pid " $1 ")" } END { print "VPN processes:" (s == "" ? " none" : s) }' procs.tsv
+	_c=
+	for _p in /etc/openvpn /etc/config/openvpn /etc/config/ovpnclient /etc/config/ovpnserver /etc/config/tailscale /var/lib/tailscale /etc/config/zerotier /var/lib/zerotier-one /etc/config/wireguard; do
+		[ -e "$_p" ] && _c="$_c $_p"
+	done
+	echo "VPN config present:${_c:- none}"
 }
 
 _net_interfaces() {
@@ -90,6 +244,11 @@ _net_interfaces() {
 		head -n 100 brv.txt
 	fi
 
+	_net_netifd
+}
+
+# netifd's logical interfaces, or the uci network interfaces when ubus is not reachable
+_net_netifd() {
 	section "netifd interfaces (ubus network.interface dump)"
 	if lib_ubus network.interface dump >ifdump.json && [ -s ifdump.json ]; then
 		jsonfilter -i ifdump.json -e '@.interface[*]' >ifaces.txt 2>/dev/null
@@ -130,8 +289,8 @@ _net_interfaces() {
 }
 
 _net_routes() {
-	section "IPv4 routes, all tables (ip route show table all)"
-	ip route show table all 2>&1
+	section "IPv4 routes, all tables (ip -4 route show table all)"
+	ip -4 route show table all 2>&1
 	section "IPv6 routes, all tables (ip -6 route show table all)"
 	ip -6 route show table all 2>&1
 	section "Policy routing rules (ip rule, ip -6 rule)"
@@ -182,13 +341,13 @@ _net_dns() {
 
 	section "dnsmasq generated and extra config (upstreams, overrides, includes)"
 	_any=0
-	for _f in /var/etc/dnsmasq.conf* /tmp/etc/dnsmasq.conf* /etc/dnsmasq.conf /tmp/dnsmasq.d/* /tmp/dnsmasq.cfg*.d/* /etc/dnsmasq.d/*; do
-		[ -f "$_f" ] || continue
+	_net_dnsmasq_files >dnsmasq.files
+	while IFS= read -r _f; do
 		_any=1
 		_c=$(grep -c -v -E '^[[:space:]]*(#|$)' "$_f" 2>/dev/null)
 		echo "$_f ($_c settings):"
 		rd "$_f" | grep -E '^[[:space:]]*(server|address|local|conf-dir|conf-file|addn-hosts|resolv-file|servers-file|port|no-resolv|ipset|nftset|dhcp-script|cname|host-record)[=[:space:]]' | head -n 60 | sed 's/^/  /'
-	done
+	done <dnsmasq.files
 	[ "$_any" = 1 ] || echo "none found (/var/etc/dnsmasq.conf*, /etc/dnsmasq.conf, /tmp/dnsmasq.d)"
 
 	section "Hosts files"
@@ -287,12 +446,12 @@ _net_vpn() {
 	lib_uci_dump network >net.uci
 	awk -F '\t' '
 		$1 == "S" { t[$2] = $3; next }
-		$3 == "proto" && $4 == "wireguard" { wi[++n] = $2; next }
+		$3 == "proto" && $4 ~ /^(wireguard|wgclient|wgserver)$/ { wi[++n] = $2; pr[$2] = $4; next }
 		{ if (($2, $3) in v) v[$2, $3] = v[$2, $3] "," $4; else v[$2, $3] = $4 }
 		END {
-			if (!n) { print "uci: no interface with proto wireguard"; exit }
+			if (!n) { print "uci: no interface with proto wireguard, wgclient or wgserver"; exit }
 			for (i = 1; i <= n; i++) {
-				s = wi[i]; printf "uci interface %s: listen_port=%s addresses=%s\n", s, ((s, "listen_port") in v) ? v[s, "listen_port"] : "-", v[s, "addresses"]
+				s = wi[i]; printf "uci interface %s (proto %s): listen_port=%s addresses=%s\n", s, pr[s], ((s, "listen_port") in v) ? v[s, "listen_port"] : "-", v[s, "addresses"]
 				for (k in t) if (t[k] == "wireguard_" s)
 					printf "  peer %s: description=%s endpoint=%s:%s allowed_ips=%s public_key=%s\n", k, v[k, "description"], v[k, "endpoint_host"], v[k, "endpoint_port"], v[k, "allowed_ips"], v[k, "public_key"]
 			}
@@ -498,14 +657,6 @@ tool_firewall() {
 				printf "%-28s proto=%s dest_port=%s src_ip=%s family=%s icmp_type=%s%s\n", g(s, "name", s), g(s, "proto", "any"), g(s, "dest_port", "any"), g(s, "src_ip", "any"), g(s, "family", "any"), g(s, "icmp_type", "-"), (g(s, "enabled", "1") == "0" ? " (disabled)" : "")
 			}
 			if (!c) print "none"
-			print "\n== All rules"
-			c = 0
-			for (i = 1; i <= n; i++) {
-				s = o[i]; if (t[s] != "rule") continue
-				c++
-				printf "%-28s %s -> %s proto=%s dest_port=%s target=%s%s\n", g(s, "name", s), g(s, "src", "(router)"), g(s, "dest", "(router)"), g(s, "proto", "any"), g(s, "dest_port", "any"), g(s, "target", "-"), (g(s, "enabled", "1") == "0" ? " (disabled)" : "")
-			}
-			if (!c) print "none"
 			print "\n== Port forwards (redirects)"
 			c = 0
 			for (i = 1; i <= n; i++) {
@@ -522,10 +673,33 @@ tool_firewall() {
 				printf "%-20s path=%s type=%s position=%s reload=%s%s\n", s, g(s, "path", "-"), g(s, "type", "script"), g(s, "position", "-"), g(s, "reload", "-"), (g(s, "enabled", "1") == "0" ? " (disabled)" : "")
 			}
 			if (!c) print "none"
+			print "\n== All rules"
+			c = 0
+			for (i = 1; i <= n; i++) {
+				s = o[i]; if (t[s] != "rule") continue
+				c++
+				printf "%-28s %s -> %s proto=%s dest_port=%s target=%s%s\n", g(s, "name", s), g(s, "src", "(router)"), g(s, "dest", "(router)"), g(s, "proto", "any"), g(s, "dest_port", "any"), g(s, "target", "-"), (g(s, "enabled", "1") == "0" ? " (disabled)" : "")
+			}
+			if (!c) print "none"
 		}' fw.uci
 	else
 		echo "no /etc/config/firewall"
 	fi
+
+	section "UPnP / NAT-PMP"
+	if [ -f /etc/config/upnpd ]; then
+		lib_uci_dump upnpd | awk -F '\t' '$3 ~ /^(enabled|enable_upnp|enable_natpmp|secure_mode|external_iface|internal_iface|upnp_lease_file|log_output)$/ { printf "%s.%s=%s\n", $2, $3, $4 }'
+	else
+		echo "no /etc/config/upnpd (miniupnpd not installed)"
+	fi
+	_net_running '^miniupnpd$'
+	_lf=$(lib_uci_dump upnpd | awk -F '\t' '$3 == "upnp_lease_file" { print $4; exit }')
+	for _f in ${_lf:-/var/run/miniupnpd.leases} /var/upnp.leases; do
+		[ -f "$_f" ] || continue
+		echo "leases ($_f, PROTO:EXT_PORT:INT_IP:INT_PORT:EXPIRY:DESCRIPTION):"
+		rd "$_f" | head -n 100 | sed 's/^/  /'
+		break
+	done
 
 	section "Custom rule files"
 	for _f in /etc/firewall.user /etc/firewall.d; do
@@ -549,21 +723,6 @@ tool_firewall() {
 	done
 	echo "/etc/nftables.d and /usr/share/nftables.d (fw4 includes these automatically):"
 	_net_files /etc/nftables.d /usr/share/nftables.d
-
-	section "UPnP / NAT-PMP"
-	if [ -f /etc/config/upnpd ]; then
-		lib_uci_dump upnpd | awk -F '\t' '$3 ~ /^(enabled|enable_upnp|enable_natpmp|secure_mode|external_iface|internal_iface|upnp_lease_file|log_output)$/ { printf "%s.%s=%s\n", $2, $3, $4 }'
-	else
-		echo "no /etc/config/upnpd (miniupnpd not installed)"
-	fi
-	_net_running '^miniupnpd$'
-	_lf=$(lib_uci_dump upnpd | awk -F '\t' '$3 == "upnp_lease_file" { print $4; exit }')
-	for _f in ${_lf:-/var/run/miniupnpd.leases} /var/upnp.leases; do
-		[ -f "$_f" ] || continue
-		echo "leases ($_f, PROTO:EXT_PORT:INT_IP:INT_PORT:EXPIRY:DESCRIPTION):"
-		rd "$_f" | head -n 100 | sed 's/^/  /'
-		break
-	done
 
 	section "Active ruleset"
 	_any=0
