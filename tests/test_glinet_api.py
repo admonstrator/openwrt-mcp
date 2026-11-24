@@ -116,22 +116,89 @@ class TestCatalog(unittest.TestCase):
                 seen.add((f[1], f[2]))
         self.assertGreater(len(seen), 300)
 
+    # Written down by hand from the API documentation, independent of the generator's
+    # rules table: every method that can cut the owner off, open the router or the LAN
+    # to someone, switch or drop the uplink, delete, flash, reboot (also on a schedule),
+    # change credentials or cost money.
+    MUST_BE_RISKY = """
+        system.reboot system.reset_firmware system.set_password ui.init ui.set_inited_internet
+        upgrade.upgrade_online upgrade.upgrade_local upgrade.upgrade_cellular_online upgrade.upgrade_cellular_local
+        local-access.set_config netmode.set_mode lan.set_config lan.remove_static_bind
+        cloud.bind_device cloud.rebind cloud.unbind cloud.set_config cloud.bind_info rtty.run rtty.set_config rtty.stop
+        acl.add_user acl.add_acl acl.remove_user
+        firewall.set_wan_access firewall.set_dmz firewall.add_rule firewall.set_rule firewall.remove_rule
+        firewall.add_port_forward firewall.set_port_forward firewall.remove_port_forward firewall.order_port_forward
+        network.set_advance_config ipv6.set_ipv6
+        nas-web.set_proto_config nas-web.conf_nas_wan_access nas-web.add_user nas-web.set_user_pwd nas-web.add_share
+        nas-web.set_share nas-web.disk_format
+        wg-server.start wg-server.stop wg-server.set_config wg-server.add_peer wg-server.set_peer wg-server.remove_peer
+        wg-server.generate_peer wg-server.generate_key wg-server.set_setting wg-server.add_route wg-server.set_route
+        ovpn-server.set_config ovpn-server.set_setting ovpn-server.generate_certificate ovpn-server.add_user
+        ovpn-server.remove_user ovpn-server.add_route ovpn-server.set_route ovpn-server.export_config
+        tailscale.set_config tailscale.logout tailscale.get_auth_url zerotier.set_config tor.set_config
+        s2s.set_config s2s.remove_config
+        vpn-client.set_options vpn-client.set_default_tunnel vpn-client.set_global_mode vpn-client.set_tap_s2s
+        vpn-client.add_tunnel vpn-client.set_tunnel vpn-client.remove_tunnel vpn-client.order_tunnel
+        vpn-client.set_single_mac vpn-client.start_random_client vpn-client.stop wg_client.start_random_client
+        wg_client.update_provider_config wg_client.generate_provider_config wg_client.create_provider_account
+        wg-client.set_config wg-client.set_group wg-client.remove_config wg-client.clear_config_list
+        ovpn-client.set_config ovpn-client.set_group ovpn-client.remove_config ovpn-client.clear_config_list
+        wifi.set_config wifi.set_mlo_config wifi.set_environment_config timer.set_wifi timer.set_reboot
+        black_white_list.set_config black_white_list.set_single_mac
+        parental-control.set_config parental-control.set_mode parental-control.add_group parental-control.set_group
+        parental-control.add_rule parental-control.set_rule parental-control.set_brief
+        cable.set_config cable.set_port_config edgerouter.set_config kmwan.set_config kmwan.set_interface
+        mptun.set_config dns.set_config dns.set_host adguardhome.set_config
+        repeater.connect repeater.disconnect repeater.set_config repeater.enter_bare_mode repeater.exit_bare_mode
+        repeater.remove_saved_ap
+        modem.set_connect modem.disconnect modem.set_sim_config modem.set_slot_failover_config modem.set_cell_tower
+        modem.set_operator_config modem.set_3gpp_rel modem.set_traffic_config modem.set_sim_pin_code
+        modem.send_at_command modem.send_sms modem.remove_sms sms-forward.set_phone_number sms-forward.set_email
+        tethering.set_connect tethering.disconnect
+        lpm.set_config otg.set_config system.set_usb_config screen.set_config screen.reset_unlock_attempts
+        plugins.install_package plugins.remove_package plugins.set_config luci.install_luci luci.uninstall_luci
+        upgrade.reset_cellular_upgrade_status logread.remove_crash_log clients.remove_offline
+    """.split()
+
+    # What may run without confirm although it is not a query: written down by hand
+    # too, so that a method that becomes active by a rule or a new documentation
+    # fails here until someone has looked at it.
+    MAY_BE_ACTIVE = """
+        acl.add_group logread.export_logs logread.set_config dlna.set_config nas-web.eject_disk nas-web.test_api
+        nas-web.test_api123 modem.scan_cell_tower modem.scan_operator_list modem.set_sms clients.set_info
+        clients.clean_traffic parental-control.check_blacklist_online qos.set_speed_limit_rule
+        qos.remove_speed_limit_rule plugins.update_repository upgrade.check_firmware_online
+        upgrade.check_firmware_local upgrade.check_cellular_local upgrade.check_cellular_online upgrade.set_config
+        upgrade.report_upgrade_method cable.wan_proto_detect cable.init_status diag.ping diag.traceroute
+        edgerouter.get_status igmp.set_config kmwan.set_sensitivity lan.add_static_bind lan.set_static_bind
+        network.get_available_address_list network.set_netnat_config ddns.set_config ddns.get_status led.set_config
+        lpm.set_notify mcu.set_battery_config mcu.set_oled_config system.set_timezone_config timer.set_led
+        timer.set_screen timer.set_disk ui.set_lang ui.get_remote_langs ui.update_langs mptun.get_token
+        ovpn-client.add_group ovpn-client.add_config ovpn-client.check_config ovpn-client.confirm_config
+        ovpn-client.get_recommend_config ovpn-client.get_third_config ovpn_client.set_config_name
+        vpn-client.check_domain_online wg-client.add_group wg-client.add_config wg-client.check_config
+        wg-client.confirm_config wg-server.generate_publickey wg_client.gen_key wg_client.get_provider_server_list
+        wg_client.get_provider_user_info wg_client.init_provider_group repeater.scan repeater.set_channel_prompt
+        wifi.set_txpower
+    """.split()
+
     def test_what_must_be_risky_is(self):
         cat = catalog()
-        for name in ("system.reboot", "system.reset_firmware", "system.set_password", "ui.init",
-                     "upgrade.upgrade_online", "upgrade.upgrade_local", "upgrade.upgrade_cellular_online",
-                     "local-access.set_config", "netmode.set_mode", "lan.set_config",
-                     "cloud.bind_device", "cloud.rebind", "cloud.unbind", "cloud.set_config", "rtty.run",
-                     "rtty.set_config", "firewall.set_wan_access", "firewall.set_dmz", "firewall.add_port_forward",
-                     "firewall.remove_rule", "vpn-client.set_options", "vpn-client.set_default_tunnel",
-                     "wifi.set_config", "tailscale.set_config", "tailscale.logout", "plugins.install_package",
-                     "plugins.remove_package", "modem.send_at_command", "modem.send_sms", "wg-server.remove_peer",
-                     "ovpn-client.remove_config", "acl.add_user", "nas-web.disk_format"):
+        for name in self.MUST_BE_RISKY:
+            self.assertIn(name, cat)
             self.assertEqual(cat[name][0], "r", name)
+            self.assertTrue(cat[name][1], name)
+
+    def test_nothing_is_active_that_was_not_looked_at(self):
+        cat = catalog()
+        active = sorted(n for n, (c, _) in cat.items() if c == "a")
+        self.assertEqual(active, sorted(self.MAY_BE_ACTIVE))
+        self.assertFalse(set(self.MAY_BE_ACTIVE) & set(self.MUST_BE_RISKY))
 
     def test_queries_with_side_effects_are_not_queries(self):
         cat = catalog()
-        for name in ("tailscale.get_auth_url", "ddns.get_status", "upgrade.check_firmware_online",
+        self.assertEqual(cat["tailscale.get_auth_url"][0], "r")
+        for name in ("ddns.get_status", "upgrade.check_firmware_online",
                      "upgrade.check_cellular_online", "diag.ping", "diag.traceroute", "repeater.scan",
                      "ui.get_remote_langs", "plugins.update_repository"):
             self.assertEqual(cat[name][0], "a", name)
@@ -241,7 +308,8 @@ methods:
         lines = [line.split("\t") for line in r.stdout.splitlines() if "\ttailscale\t" in line or line.startswith("P\t")]
         self.assertEqual(lines, [
             ["O", "tailscale", "remote-access", "Tailscale: mesh VPN."],
-            ["M", "tailscale", "get_auth_url", "a", "restarts Tailscale", "Restarts Tailscale and returns a login URL."],
+            ["M", "tailscale", "get_auth_url", "r", "restarts Tailscale and asks for a new login: access through the "
+             "tailnet drops", "Restarts Tailscale and returns a login URL."],
             ["M", "tailscale", "set_config", "r", "turns Tailscale on or off and decides what the tailnet may reach "
              "(LAN, WAN, exit node); restarts it", "Changes the config - and restarts."],
             ["P", "enabled", "boolean", "y", "", "On or off."],
@@ -254,7 +322,9 @@ methods:
         ])
         # a destructive method without a rule is risky because the documentation says so
         r = self.run_generator({"system/system.yaml": "object: system\ncategory: system\nsummary: S.\nmethods:\n"
-                                "  - name: reboot\n    summary: Reboots.\n    destructive: true\n"}, stubs=True)
+                                "  - name: reboot\n    summary: Reboots.\n    destructive: true\n"
+                                "  - name: set_usb_config\n    summary: Sets USB.\n"}, stubs=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("M\tsystem\treboot\tr\tdocumented as destructive\tReboots.\n", r.stdout)
 
     def test_generator_is_deterministic_and_posix(self):
@@ -324,8 +394,10 @@ class TestListing(OpenWrtTestCase):
         self.assertRegex(text, r"(?m)^    encryption \(string, optional; one of none\|psk2\|")
         self.assertRegex(text, r'(?m)^    key \(string, required if encryption is not "none"\): ')
         text = self.tool_ok("glinet_api", env=GL_ENV, object="tailscale")
-        self.assertRegex(text, r"(?m)^tailscale\.get_auth_url  \[active\]  Restarts Tailscale")
-        self.assertRegex(text, r"(?m)^    note: restarts Tailscale$")
+        self.assertRegex(text, r"(?m)^tailscale\.get_auth_url  \[CONFIRM\]  Restarts Tailscale")
+        text = self.tool_ok("glinet_api", env=GL_ENV, object="upgrade")
+        self.assertRegex(text, r"(?m)^upgrade\.check_firmware_online  \[active\]  Checks")
+        self.assertRegex(text, r"(?m)^    note: contacts the GL.iNet firmware servers$")
 
     @needs_container
     def test_object_not_on_this_router_and_unknown_ones(self):
@@ -382,6 +454,16 @@ class TestListing(OpenWrtTestCase):
             self.assertIn("cannot list /usr/lib/oui-httpd/rpc", text)
             self.assertRegex(text, r"== API objects in the catalog \(\d+\)")
             self.assertRegex(text, r"(?m)^modem  \(")
+            # ... and nothing is called: an object counts as present only with its file
+            n = len(calls(self))
+            for obj, meth in (("system", "get_info"), ("nosuchobject", "get_x"), ("security-scan", "get_status")):
+                text, err = self.tool("glinet_api", env=GL_ENV, object=obj, method=meth)
+                self.assertTrue(err, text)
+                self.assertIn(f"{obj}.{meth}: not called. /usr/lib/oui-httpd/rpc cannot be listed", text)
+            text, err = self.tool("glinet_api", env=GL_ENV, object="system", method="reboot", confirm=True)
+            self.assertTrue(err, text)
+            self.assertIn("system.reboot: not called.", text)
+            self.assertEqual(len(calls(self)), n)
         finally:
             self.sh("mv /usr/lib/oui-httpd/rpc.off /usr/lib/oui-httpd/rpc")
 
@@ -519,10 +601,14 @@ class TestCalls(OpenWrtTestCase):
         self.assertTrue(err)
         self.assertEqual(calls(self), [])
         # a changing method without required parameters does run with none
-        answer(self, "tailscale.get_auth_url", {"result": {"auth_url": "https://login.tailscale.com/a/abc"}})
-        text = self.tool_ok("glinet_api", env=GL_ENV, object="tailscale", method="get_auth_url")
-        self.assertIn("https://login.tailscale.com/a/abc", text)
-        self.assertIn("== Config changes", text, "get_auth_url restarts Tailscale: not a query")
+        answer(self, "upgrade.check_firmware_online", {"result": {"current_version": "4.8.5"}})
+        text = self.tool_ok("glinet_api", env=GL_ENV, object="upgrade", method="check_firmware_online")
+        self.assertIn('"current_version": "4.8.5"', text)
+        self.assertIn("== Config changes", text, "it goes to the internet: not a query")
+        # named like a query, but it restarts Tailscale and asks for a new login
+        text, err = self.tool("glinet_api", env=GL_ENV, object="tailscale", method="get_auth_url")
+        self.assertTrue(err)
+        self.assertIn("tailscale.get_auth_url: NOT CALLED, it needs confirmation", text)
 
     @needs_container
     def test_validator_rejection(self):
@@ -538,10 +624,10 @@ class TestCalls(OpenWrtTestCase):
     @needs_container
     def test_other_errors(self):
         # the fake answers "Method not found" for what it has no file for
-        text, err = self.tool("glinet_api", env=GL_ENV, object="wifi", method="get_status")
+        text, err = self.tool("glinet_api", env=GL_ENV, object="wifi", method="get_mlo_config")
         self.assertTrue(err)
-        self.assertIn("wifi.get_status: GL API ERROR -32601: Method not found", text)
-        self.assertIn("This firmware has no method wifi.get_status", text)
+        self.assertIn("wifi.get_mlo_config: GL API ERROR -32601: Method not found", text)
+        self.assertIn("This firmware has no method wifi.get_mlo_config", text)
         answer(self, "wifi.set_txpower", {"error": {"code": -1, "message": "radio busy"}})
         text, err = self.tool("glinet_api", env=GL_ENV, object="wifi", method="set_txpower", params={"x": 1})
         self.assertTrue(err)
@@ -603,8 +689,8 @@ class TestCalls(OpenWrtTestCase):
         for secret in (WIFI_KEY, "482913", "SESSIONID42", "TOKENTOKEN", "pw-in-object", "pw-in-array", WG_PRIVATE, WG_PSK,
                        "12345678", "MIIEvQIBADANBg", "BKcwggSjAgEA", "MIIabcdefSECRETBODY", WG_PRIVATE[:12], WG_PSK[:12]):
             self.assertNotIn(secret, text)
-        for kept in ('"ssid": "HomeNet"', '"wifi_password_enabled": true', '"token_status": 2',
-                     '"public_key": "PUBLICKEYISFINE="', '"presharedkey_enable": true', '"pin_counter": 3', "keep-me",
+        for kept in ('"ssid": "HomeNet"', '"wifi_password_enabled": true',
+                     '"public_key": "PUBLICKEYISFINE="', '"presharedkey_enable": true', "keep-me",
                      "Address = 10.0.0.2/24", "PublicKey = pubpubpub=", "Endpoint = a.example:51820",
                      "PrivateKey = <redacted>", "PresharedKey = <redacted>", '"credentials": "<redacted>",',
                      '"cert": "<redacted private key>\\ntrailer",', '"open_pem": "<redacted private key>",',
@@ -616,6 +702,70 @@ class TestCalls(OpenWrtTestCase):
         text = self.tool_ok("glinet_api", env={**GL_ENV, "MCP_REDACT": "0"}, object="wifi", method="get_config")
         self.assertIn(WIFI_KEY, text)
         self.assertIn(WG_PRIVATE, text)
+
+    @needs_container
+    def test_numbers_and_containers_under_secret_names_are_masked(self):
+        """The names are those redact knows (issecret in the core), whatever the JSON type."""
+        answer(self, "wifi.get_status", {"result": {
+            "wps_pin": 12345670, "authkey": 99887766, "wep_key1": 55443322, "community": 77665544,
+            "api-token": 11223344, "pin": -4711.5, "keys": [31313131, "arraysecret"], "psk": {"a": 42424242},
+            "key_mgmt": "WPA-PSK", "key_id": 3, "password_auth": 1, "channel": 36,
+            "note": "see pin 1 on the board", "enabled": True}})
+        text = self.tool_ok("glinet_api", env=GL_ENV, object="wifi", method="get_status")
+        for secret in ("12345670", "99887766", "55443322", "77665544", "11223344", "4711", "31313131", "arraysecret",
+                       "42424242"):
+            self.assertNotIn(secret, text)
+        for kept in ('"key_mgmt": "WPA-PSK"', '"key_id": 3', '"password_auth": 1', '"channel": 36',
+                     '"note": "see pin 1 on the board"', '"enabled": true', '"wps_pin": "<redacted>",',
+                     '"keys": "<redacted>",', '"psk": "<redacted>",'):
+            self.assertIn(kept, text)
+        json.loads(text.split("== Answer\n", 1)[1])
+
+    @needs_container
+    def test_secrets_in_error_texts_are_masked(self):
+        # the GL error message: in the status line and in the answer below it
+        answer(self, "wifi.set_txpower", {"error": {"code": -1, "message": "bad value password=hunter2secret for wifi0"}})
+        text, err = api(self, {"object": "wifi", "method": "set_txpower", "params": {"x": 1}})
+        self.assertTrue(err)
+        self.assertIn("wifi.set_txpower: GL API ERROR -1: bad value password=<redacted> for wifi0", text)
+        self.assertNotIn("hunter2secret", text)
+        json.loads(text.split("== Answer\n", 1)[1])
+        # an error that is no object, with other ways of writing a secret
+        for raw in ("key: hunter2secret rejected", "wrong passphrase 'hunter2secret is long' given",
+                    'token = "hunter2secret"', "psk=\"hunter2secret\"", '{"wps_pin":"hunter2secret"}',
+                    'the passphrase "hunter2secret is long" was refused', "line one\nauthkey=hunter2secret\nline three"):
+            with self.subTest(raw=raw):
+                answer(self, "wifi.get_config", {"error": raw})
+                text, err = api(self, {"object": "wifi", "method": "get_config"})
+                self.assertTrue(err)
+                self.assertIn("wifi.get_config: GL API ERROR: ", text)
+                self.assertNotIn("hunter2secret", text)
+                self.assertNotIn("is long", text)
+                json.loads(text.split("== Answer\n", 1)[1])
+        # err_msg inside a result
+        answer(self, "tailscale.get_status", {"result": {"err_code": 1, "err_msg": "login failed, secret=hunter2secret"}})
+        text = self.tool_ok("glinet_api", env=GL_ENV, object="tailscale", method="get_status")
+        self.assertIn("but the answer carries err_msg: login failed, secret=<redacted>", text)
+        self.assertNotIn("hunter2secret", text)
+        # what ubus writes to stderr
+        hook(self, "system.get_load", "echo 'Command failed: bad auth token=hunter2secret' >&2; exit 9")
+        try:
+            text, err = api(self, {"object": "system", "method": "get_load"})
+            self.assertTrue(err)
+            self.assertIn("system.get_load: the ubus call failed (exit 9): Command failed: bad auth token=<redacted>", text)
+            self.assertNotIn("hunter2secret", text)
+        finally:
+            self.sh("rm /fixture/gl/hooks/system.get_load")
+        # harmless text is left alone, and nothing is masked with redaction off
+        answer(self, "wifi.get_config", {"error": {"code": -5, "message": "password too short: at least 8 characters"}})
+        text, err = api(self, {"object": "wifi", "method": "get_config"})
+        self.assertIn("GL API ERROR -5: password too short: at least 8 characters", text)
+        answer(self, "wifi.get_config", {"error": {"code": -5, "message": "channel=36 is not allowed in this country"}})
+        text, err = api(self, {"object": "wifi", "method": "get_config"})
+        self.assertIn("GL API ERROR -5: channel=36 is not allowed in this country", text)
+        answer(self, "wifi.get_config", {"error": {"code": -1, "message": "bad value password=hunter2secret"}})
+        text, err = api(self, {"object": "wifi", "method": "get_config"}, env={**GL_ENV, "MCP_REDACT": "0"})
+        self.assertIn("password=hunter2secret", text)
 
     @needs_container
     def test_secrets_in_config_changes_are_masked(self):

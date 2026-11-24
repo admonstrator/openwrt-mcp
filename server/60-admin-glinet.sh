@@ -127,21 +127,120 @@ _ga_doc() {
 	}'
 }
 
+# The awk function secret(NAME): is NAME the name of a secret? The rules are those of
+# issecret in redact (server/00-core.sh), so that a name masked in a file is masked in
+# an API answer too, plus GL.iNet's own names (passcode, sid, puk).
+_GA_SECRET='
+	function secret(n,   k, i, part) {
+		n = tolower(n)
+		if (n ~ /^(.*[_-])?(pub|public)_?key$|^(.*[_-])?key_?(mgmt|id|index|type|len|length|size|format)$|password_?auth$/) return 0
+		if (n ~ /password|passwd|passphrase|passcode|secret|token|credential|psk|privatekey|presharedkey|pwd/) return 1
+		k = split(n, part, /[^a-z0-9]+/)
+		for (i = 1; i <= k; i++)
+			if (part[i] ~ /^(pass|pin|pin[0-9]+|pincode|puk|sid|community|keys|r[01]kh)$/ || part[i] ~ /key[0-9]*$/) return 1
+		return 0
+	}'
+
+# _ga_words: filter that masks secrets written into running text: the value in
+# name=value, name: value, name = value and name "value" when the name is that of a
+# secret. On a line of pretty-printed JSON only the string value is looked at, and its
+# closing quote and comma stay.
+_ga_words() {
+	if [ "$MCP_REDACT" != 1 ]; then cat; return; fi
+	awk "$_GA_SECRET"'
+	# the name a token ends with: its last word, after JSON escapes such as \n
+	function clean(s,   k, w) {
+		gsub(/\\[nrt"\/]/, " ", s); gsub(/[^A-Za-z0-9_.-]+/, " ", s)
+		k = split(s, w, " ")
+		return k ? w[k] : ""
+	}
+	# the quote token t opens with: a single quote, a double quote in plain text, an
+	# escaped one (\") inside a JSON string; "" when it opens with none
+	function openq(t, js) {
+		if (substr(t, 1, 1) == sq) return sq
+		if (!js && substr(t, 1, 1) == "\"") return "\""
+		if (js && substr(t, 1, 2) == "\\\"") return "\\\""
+		return ""
+	}
+	function ends(u, q) { return length(u) >= length(q) && substr(u, length(u) - length(q) + 1) == q }
+	# the masked form of value token v; js: the value ends at an escaped newline, and
+	# what closes the JSON around it (quotes, backslashes, brackets, a comma) stays.
+	# A value that is masked already stays.
+	function masked(v, js,   tail, i) {
+		if (index(v, "<redacted>")) return v
+		tail = ""
+		if (js) {
+			i = index(v, "\\n")
+			if (i) return "<redacted>" substr(v, i)
+			if (match(v, /[]\\",}]+$/)) tail = substr(v, RSTART)
+		}
+		return "<redacted>" tail
+	}
+	function words(s, js,   out, mask, q, prev, pre, t, u, c, name, v, n, tj) {
+		out = ""; mask = 0; q = ""; prev = ""
+		while (match(s, /[^ \t]+/)) {
+			pre = substr(s, 1, RSTART - 1); t = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+			if (q != "") {
+				# inside a quoted value of several words: dropped up to its closing
+				# quote; what closes the JSON string after it stays
+				u = t; tj = ""
+				if (js && u ~ /[^\\]",?$/) { match(u, /",?$/); tj = substr(u, RSTART); u = substr(u, 1, RSTART - 1) }
+				sub(/[,.;)]*$/, "", u)
+				if (ends(u, q)) q = ""
+				t = tj; pre = ""
+			} else if (mask) {
+				mask = 0
+				c = openq(t, js)
+				if (c != "" && index(substr(t, length(c) + 1), c) == 0) q = c
+				t = masked(t, js)
+			} else if (t == "=" || t == ":") {
+				if (secret(clean(prev))) mask = 1
+			} else if (match(t, /^[^=:]+[=:]/)) {
+				n = RLENGTH
+				name = clean(substr(t, 1, n - 1)); v = substr(t, n + 1)
+				if (secret(name)) {
+					if (v == "") mask = 1
+					else {
+						c = openq(v, js)
+						if (c != "" && index(substr(v, length(c) + 1), c) == 0) q = c
+						t = substr(t, 1, n) masked(v, js)
+					}
+				}
+			} else if (secret(clean(t))) {
+				u = s; sub(/^[ \t]+/, "", u)
+				if (openq(u, js) != "") mask = 1
+			}
+			prev = t
+			out = out pre t
+		}
+		return out s
+	}
+	BEGIN { sq = sprintf("%c", 39) }
+	{
+		if (match($0, /^[ \t]*"[^"]*"[ \t]*:[ \t]*"/)) {
+			# a member with a string value
+			n = RLENGTH
+			print substr($0, 1, n) words(substr($0, n + 1), 1)
+		} else if ($0 ~ /^[ \t]*("[^"]*"[ \t]*:.*|[][{}],?)[ \t]*$/) print
+		else if (match($0, /^[ \t]*"/)) {
+			# a string in an array
+			n = RLENGTH
+			print substr($0, 1, n) words(substr($0, n + 1), 1)
+		} else print words($0, 0)
+	}'
+}
+
+# _ga_text: filter for free text that comes from the router (an error message, what
+# ubus wrote to stderr): _ga_words, then _ga_mask and redact.
+_ga_text() { _ga_words | _ga_mask | redact; }
+
 # _ga_mask: filter for the API answer as ubus prints it (one JSON member per line):
-# masks the values of members that hold secrets by GL.iNet's names, whatever their JSON
-# type, and private keys inside longer strings (a WireGuard or OpenVPN client config).
-# redact runs after it for the names the core knows.
+# masks the value of every member whose name is that of a secret, whatever its JSON
+# type (string, number, object, array; not true, false, null), and private keys inside
+# longer strings (a WireGuard or OpenVPN client config). redact runs after it.
 _ga_mask() {
 	if [ "$MCP_REDACT" != 1 ]; then cat; return; fi
-	awk '
-	function secret(n) {
-		n = tolower(n)
-		if (n ~ /(^|_)(pub|public)_?key$/) return 0
-		if (n ~ /password|passwd|pwd|passphrase|passcode|secret|credential/) return 1
-		if (n ~ /(^|[_-])(key|psk|pass|token|sid)$/ || n ~ /(private|preshared)_?key/) return 1
-		if (n ~ /^(sim_?)?(pin|puk)(_?code)?$/) return 1
-		return 0
-	}
+	awk "$_GA_SECRET"'
 	# a line that holds key material inside a string: the same line with it masked
 	function inner(s,   out, a, b) {
 		out = ""
@@ -287,7 +386,13 @@ tool_glinet_api() {
 	[ -z "$_ga_search" ] || { tool_error "search is for listings: leave out method to search, or leave out search to call"; return; }
 	_ga_name=$_ga_obj.$_ga_meth
 
-	if [ "$_ga_known" = 1 ] && ! grep -q -x -e "$_ga_obj" present; then
+	# an object is called only when it has a file in the RPC directory; without that
+	# directory nothing is known to exist, so nothing is called
+	if [ "$_ga_known" != 1 ]; then
+		tool_error "$_ga_name: not called. $_GA_RPC cannot be listed, so it is unknown whether this router has an API object '$_ga_obj'; only objects found there are called."
+		return
+	fi
+	if ! grep -q -x -e "$_ga_obj" present; then
 		tool_error "$_ga_name: not called. This router has no API object '$_ga_obj' (nothing of that name in $_GA_RPC). Call glinet_api without arguments for the objects it has."
 		return
 	fi
@@ -369,14 +474,14 @@ tool_glinet_api() {
 		echo "$_ga_name: NO ANSWER after $_ga_wait s (timeout). The router may still be working on the call or may have finished it: read the state back before trying again, and use a longer timeout for slow methods."
 		_ga_bad=1
 	elif [ "$_ga_rc" != 0 ]; then
-		echo "$_ga_name: the ubus call failed (exit $_ga_rc): $(head -c 300 ubus.err | tr '\n' ' ')"
+		echo "$_ga_name: the ubus call failed (exit $_ga_rc): $(head -c 300 ubus.err | tr '\n' ' ' | _ga_text)"
 		case $_ga_rc in 3 | 4) echo "ubus no longer finds gl-session or its method call." ;; esac
 		_ga_bad=1
 	else
 		case $(jsonfilter -i answer -t '@.error' 2>/dev/null) in
 		object)
 			_ga_code=$(jsonfilter -i answer -e '@.error.code' 2>/dev/null | head -n 1 | tr -cd '0-9-')
-			_ga_msg=$(jsonfilter -i answer -e '@.error.message' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300)
+			_ga_msg=$(jsonfilter -i answer -e '@.error.message' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300 | _ga_text)
 			echo "$_ga_name: GL API ERROR ${_ga_code:-?}: ${_ga_msg:-(no message)}"
 			_ga_bad=1
 			case $_ga_code in
@@ -393,11 +498,11 @@ tool_glinet_api() {
 			;;
 		'' | null)
 			echo "$_ga_name: ok"
-			_ga_em=$(jsonfilter -i answer -e '@.result.err_msg' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300)
+			_ga_em=$(jsonfilter -i answer -e '@.result.err_msg' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300 | _ga_text)
 			[ -z "$_ga_em" ] || echo "but the answer carries err_msg: $_ga_em"
 			;;
 		*)
-			echo "$_ga_name: GL API ERROR: $(jsonfilter -i answer -e '@.error' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300)"
+			echo "$_ga_name: GL API ERROR: $(jsonfilter -i answer -e '@.error' 2>/dev/null | head -n 1 | tr -d '\000-\037' | cut -c1-300 | _ga_text)"
 			_ga_bad=1
 			;;
 		esac
@@ -409,7 +514,7 @@ tool_glinet_api() {
 	fi
 	if [ -s answer ]; then
 		section "Answer"
-		_ga_mask <answer | redact
+		_ga_mask <answer | _ga_words | redact
 	fi
 	return "$_ga_bad"
 }
