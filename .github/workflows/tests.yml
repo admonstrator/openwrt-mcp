@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: shellcheck (server modules as POSIX sh, launcher as bash)
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -s sh server/*.sh
@@ -34,7 +34,7 @@ jobs:
     env:
       OPENWRT_IMAGE: openwrt/rootfs:x86-64-${{ matrix.openwrt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: pull the OpenWrt rootfs image
         run: docker pull "$OPENWRT_IMAGE"
       - name: unittest

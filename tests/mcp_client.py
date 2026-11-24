@@ -6,8 +6,8 @@ Environment:
   OPENWRT_PLATFORM   docker --platform   default linux/amd64
   OPENWRT_MCP_TARGET user@host of a real router; then the tests run through
                      bin/openwrt-mcp against it, and tests that need a container
-                     (fixtures, writes) are skipped. Never point it at a router you
-                     do not own.
+                     (fixtures, writes) are skipped, and so is every request that
+                     names the exec tool. Never point it at a router you do not own.
 
 Usage in a test module:
 
@@ -145,6 +145,10 @@ class Session:
             self.stderr += chunk
 
     def send_raw(self, data: bytes) -> None:
+        # Against a real router the tests stay read-only: anything that names the exec
+        # tool is skipped before it leaves this process.
+        if TARGET and b'"exec"' in data:
+            raise unittest.SkipTest("exec is never run against a real router")
         self.proc.stdin.write(data)
         self.proc.stdin.flush()
 
