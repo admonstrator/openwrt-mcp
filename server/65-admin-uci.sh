@@ -155,28 +155,28 @@ tool_uci_change() {
 		_uc_e="change $_uc_i"
 		[ "$_uc_t" = object ] || { tool_error "$_uc_e must be an object, got $_uc_t"; return; }
 		_uc_o=$(jsonfilter -s "$_uc_all" -e "@[$((_uc_i - 1))]")
+		# types and values in one go, as shell assignments jsonfilter quotes itself (the
+		# core reads requests the same way); values arrive exactly, line breaks included.
+		# Absent and null members stay unset.
+		unset _uc_top _uc_tp _uc_tv _uc_op _uc_p _uc_v
+		eval "$(jsonfilter -s "$_uc_o" -t '_uc_top=@.op' -t '_uc_tp=@.path' -t '_uc_tv=@.value' \
+			-e '_uc_op=@.op' -e '_uc_p=@.path' -e '_uc_v=@.value' 2>/dev/null)"
 		_uc_known=0
-		for _uc_k in op path value; do
-			[ "$(jsonfilter -s "$_uc_o" -t "@.$_uc_k" 2>/dev/null)" ] && _uc_known=$((_uc_known + 1))
-		done
-		_uc_members=$(jsonfilter -s "$_uc_o" -t '@.*' 2>/dev/null | sed 's/\\ / /g' | wc -w)
-		[ "$_uc_members" -eq "$_uc_known" ] || { tool_error "$_uc_e: unknown member (an operation takes op, path and value only)"; return; }
-		for _uc_k in op path value; do
-			case $(jsonfilter -s "$_uc_o" -t "@.$_uc_k" 2>/dev/null) in
-			'' | string) ;;
-			*) tool_error "$_uc_e: $_uc_k must be a string (quote numbers: \"1\")"; return ;;
+		for _uc_k in "${_uc_top-}" "${_uc_tp-}" "${_uc_tv-}"; do
+			case $_uc_k in
+			'') ;;
+			string) _uc_known=$((_uc_known + 1)) ;;
+			null) tool_error "$_uc_e: op, path and value must not be null (leave a member out instead)"; return ;;
+			*) tool_error "$_uc_e: op, path and value must be strings (quote numbers: \"1\")"; return ;;
 			esac
 		done
-		_uc_op=$(jsonfilter -s "$_uc_o" -e '@.op' 2>/dev/null)
-		_uc_p=$(jsonfilter -s "$_uc_o" -e '@.path' 2>/dev/null)
+		_uc_members=$(jsonfilter -s "$_uc_o" -t '@.*' 2>/dev/null | sed 's/\\ / /g' | wc -w)
+		[ "$_uc_members" -eq "$_uc_known" ] || { tool_error "$_uc_e: unknown or null member (an operation takes op, path and value only)"; return; }
+		_uc_op=${_uc_op-} _uc_p=${_uc_p-} _uc_v=${_uc_v-}
 		_uc_hasp=0
-		[ "$(jsonfilter -s "$_uc_o" -t '@.path' 2>/dev/null)" = string ] && _uc_hasp=1
+		[ "${_uc_tp-}" = string ] && _uc_hasp=1
 		_uc_hasv=0
-		[ "$(jsonfilter -s "$_uc_o" -t '@.value' 2>/dev/null)" = string ] && _uc_hasv=1
-		# the value exactly: jsonfilter adds one newline, $() would eat any number of them
-		_uc_v=$(jsonfilter -s "$_uc_o" -e '@.value' 2>/dev/null; echo .)
-		_uc_v=${_uc_v%.}
-		_uc_v=${_uc_v%"$_uc_nl"}
+		[ "${_uc_tv-}" = string ] && _uc_hasv=1
 		case $_uc_v in
 		*"$_uc_nl"* | *"$_uc_cr"*) tool_error "$_uc_e: the value contains a line break; uci_change takes single-line values only"; return ;;
 		esac
@@ -226,6 +226,8 @@ tool_uci_change() {
 		*) printf '%s.%s=%s\n' "$_uc_pkg" "$_uc_p" "$(_uc_q "$_uc_v")" ;;
 		esac >>plan.v
 	done
+	# jsonfilter's assignments are exported: keep values out of the environment of uci
+	unset _uc_top _uc_tp _uc_tv _uc_op _uc_p _uc_v
 	if _uc_in "$_uc_pkg" "$_UC_RISKY_PKGS"; then
 		echo "package $_uc_pkg: a change can cut off access to the router or expose it" >>risk
 	fi
