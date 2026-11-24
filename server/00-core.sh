@@ -89,7 +89,8 @@ mkdir "$MCP_TMP/tools" "$MCP_TMP/work"
 _mcp_P='' _mcp_R='' _mcp_W='' _mcp_G='' _mcp_tag=''
 _mcp_cleanup() {
 	trap '' HUP INT TERM PIPE
-	for _c in $_mcp_P $_mcp_R $_mcp_W $_mcp_G; do _mcp_kill_tree "$_c"; done
+	# the alarms first, so they cannot act any more; then the call
+	for _c in $_mcp_W $_mcp_G $_mcp_P $_mcp_R; do _mcp_kill_tree "$_c"; done
 	[ -n "$_mcp_tag" ] && _mcp_kill_tree 0 "$_mcp_tag"
 	rm -rf "$MCP_TMP"
 }
@@ -401,17 +402,23 @@ redact() {
 # ---------------------------------------------------------------- processes
 # _mcp_pids ROOT [TAG]: ROOT and all its descendants (from /proc/*/stat) and, with TAG,
 # every process whose environment holds MCP_CALL_TAG=TAG; one line, space separated.
-# Never lists this shell, pid 1 or pid 0.
+# Zombies count as gone. Prints nothing when ROOT (other than 0) is gone: then the
+# work it stood for is over. Never lists this shell, pid 1 or pid 0.
 _mcp_pids() {
 	{
 		[ -n "${2-}" ] && grep -lsF "MCP_CALL_TAG=$2" /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/.*||; s|^|T |'
 		cat /proc/[0-9]*/stat 2>/dev/null
 	} | awk -v root="$1" -v self="$$" '
 	$1 == "T" { tag[$2] = 1; next }
-	{ n = split($0, a, ")"); split(a[n], f, " "); kids[f[2]] = kids[f[2]] " " $1; alive[$1] = 1 }
+	{
+		n = split($0, a, ")"); split(a[n], f, " ")
+		if (f[1] == "Z") next
+		kids[f[2]] = kids[f[2]] " " $1; alive[$1] = 1
+	}
 	END {
 		out = ""; nq = 0; skip[self] = 1; skip[1] = 1; skip[0] = 1
-		if ((root in alive) && !(root in skip)) { q[++nq] = root; seen[root] = 1 }
+		if (root != 0 && (!(root in alive) || (root in skip))) exit
+		if (root != 0) { q[++nq] = root; seen[root] = 1 }
 		for (h = 1; h <= nq; h++) {
 			p = q[h]; out = out " " p
 			m = split(kids[p], c, " ")
@@ -423,10 +430,11 @@ _mcp_pids() {
 }
 
 # _mcp_kill_tree ROOT [TAG]: SIGKILL for ROOT, its descendants and (with TAG) tagged
-# processes. They are stopped first, until the set stops growing, so nothing can fork
-# away or be re-parented while the list is built.
+# processes; ROOT 0 means tagged processes only. They are stopped first, until the set
+# stops growing, so nothing can fork away or be re-parented while the list is built.
+# Exit status 0 when something was killed, 1 when there was nothing (ROOT gone).
 _mcp_kill_tree() {
-	[ -n "$1" ] || return 0
+	[ -n "$1" ] || return 1
 	_kt_all='' _kt_prev='' _kt_i=0
 	while [ "$_kt_i" -lt 20 ]; do
 		_kt_now=$(_mcp_pids "$1" "${2-}")
@@ -437,46 +445,68 @@ _mcp_kill_tree() {
 		[ "$_kt_now" = "$_kt_prev" ] && break
 		_kt_prev=$_kt_now _kt_i=$((_kt_i + 1))
 	done
+	[ -n "$_kt_all" ] || return 1
 	# shellcheck disable=SC2086
-	[ -n "$_kt_all" ] && { kill -KILL $_kt_all; kill -CONT $_kt_all; } 2>/dev/null
+	{ kill -KILL $_kt_all; kill -CONT $_kt_all; } 2>/dev/null
 	return 0
 }
 
-# _mcp_alarm SECS CMD [ARG...]: runs CMD in the background after SECS seconds; the
-# alarm's pid is in _mcp_alarm_pid. "kill PID" before it fires cancels it (its sleep
-# goes too); once it fires it ignores TERM until CMD is done. "wait PID" returns 9 when
-# it fired.
+# Alarms. No signal trap decides anything: a lock directory does.
+# _mcp_alarm ID SECS CMD [ARG...]: in the background, sleeps SECS seconds, then takes the
+#   lock $MCP_TMP/alarm.ID (mkdir) and runs CMD; when CMD succeeds (for _mcp_kill_tree:
+#   something was killed) it leaves the marker "fired" in the lock directory. The
+#   alarm's pid is in _mcp_alarm_pid. ID: the pid of the process the alarm guards (unique
+#   while that process is not reaped).
+# _mcp_alarm_end ID PID: ends the alarm. When the caller gets the lock first, the alarm
+#   can no longer fire: it is stopped, killed with its sleep and reaped, exit status 1.
+#   Otherwise the alarm is firing or has fired: it is waited for, and the exit status
+#   is 0 when it left the "fired" marker.
 _mcp_alarm() {
-	_al_s=$1; shift
+	_al_d=$MCP_TMP/alarm.$1 _al_s=$2
+	shift 2
+	rm -rf "$_al_d"
 	(
-		_al_z=
-		trap 'kill "$_al_z" 2>/dev/null; exit 0' TERM
-		sleep "$_al_s" &
-		_al_z=$!
-		wait "$_al_z" || exit 0
-		trap '' TERM
-		"$@"
-		exit 9
+		sleep "$_al_s"
+		mkdir "$_al_d" 2>/dev/null || exit 0
+		"$@" && : >"$_al_d/fired"
+		exit 0
 	) </dev/null >/dev/null 2>&1 3>&- &
 	_mcp_alarm_pid=$!
 }
 
+_mcp_alarm_end() {
+	_ae_d=$MCP_TMP/alarm.$1
+	if mkdir "$_ae_d" 2>/dev/null; then
+		# frozen, the alarm cannot fork or exit, so one look finds its sleep
+		kill -STOP "$2" 2>/dev/null
+		_ae_p=$(_mcp_pids "$2")
+		# shellcheck disable=SC2086
+		[ -n "$_ae_p" ] && { kill -KILL $_ae_p; kill -CONT $_ae_p; } 2>/dev/null
+		wait "$2" 2>/dev/null
+		rm -rf "$_ae_d"
+		return 1
+	fi
+	wait "$2" 2>/dev/null
+	if [ -e "$_ae_d/fired" ]; then _ae_rc=0; else _ae_rc=1; fi
+	rm -rf "$_ae_d"
+	return "$_ae_rc"
+}
+
 # Runs CMD with a time limit. Exit status 124 when the limit hit; then CMD and every
-# process it started are killed. Otherwise CMD's exit status. CMD's stdout and stderr
-# stay where they were; its stdin is /dev/null.
+# process it started are killed. Otherwise CMD's exit status, also when the limit hit
+# just after CMD ended. CMD's stdout and stderr stay where they were; its stdin is
+# /dev/null. _rt_fired is 1 after a timeout, else 0 (exec uses it to tell a timeout
+# from an exit status 124).
 run_timeout() {
 	_rt_s=$1; shift
 	case $_rt_s in '' | *[!0-9]*) _rt_s=1 ;; esac
 	"$@" </dev/null &
 	_rt_p=$!
-	_mcp_alarm "$_rt_s" _mcp_kill_tree "$_rt_p"
+	_mcp_alarm "$_rt_p" "$_rt_s" _mcp_kill_tree "$_rt_p"
 	_rt_w=$_mcp_alarm_pid
 	wait "$_rt_p" 2>/dev/null
 	_rt_rc=$?
-	kill "$_rt_w" 2>/dev/null
-	wait "$_rt_w"
-	# _rt_fired tells a caller that knows it (exec) a timeout from an exit status 124
-	[ $? = 9 ] && { _rt_fired=1; return 124; }
+	if _mcp_alarm_end "$_rt_p" "$_rt_w"; then _rt_fired=1; return 124; fi
 	_rt_fired=0
 	return "$_rt_rc"
 }
@@ -579,24 +609,21 @@ _mcp_tools_call() { # ID
 		fi
 	) <"$_ct_fifo" 3>&- &
 	_mcp_R=$!
-	_mcp_alarm "$_ct_to" _mcp_kill_tree "$_mcp_P" "$_mcp_tag"
+	_mcp_alarm "$_mcp_P" "$_ct_to" _mcp_kill_tree "$_mcp_P" "$_mcp_tag"
 	_mcp_W=$_mcp_alarm_pid
 
 	wait "$_mcp_P" 2>/dev/null
 	_rc=$?
-	kill "$_mcp_W" 2>/dev/null
-	wait "$_mcp_W"
-	_ct_fired=$?
+	_ct_fired=0
+	_mcp_alarm_end "$_mcp_P" "$_mcp_W" && _ct_fired=1
 	# a background process of the tool may still hold the FIFO open: give the reader
 	# 2 s to drain what is left, then stop it
 	_ct_held=0
 	if kill -0 "$_mcp_R" 2>/dev/null; then
-		_mcp_alarm 2 _mcp_kill_tree "$_mcp_R"
+		_mcp_alarm "$_mcp_R" 2 _mcp_kill_tree "$_mcp_R"
 		_mcp_G=$_mcp_alarm_pid
 		wait "$_mcp_R" 2>/dev/null
-		kill "$_mcp_G" 2>/dev/null
-		wait "$_mcp_G"
-		[ $? = 9 ] && _ct_held=1
+		_mcp_alarm_end "$_mcp_R" "$_mcp_G" && _ct_held=1
 	else
 		wait "$_mcp_R" 2>/dev/null
 	fi
@@ -606,7 +633,7 @@ _mcp_tools_call() { # ID
 	_err=false _cut=0 _note=
 	[ "$_rc" = 0 ] || _err=true
 	[ -e "$MCP_TMP/cut" ] && _cut=1
-	if [ "$_ct_fired" = 9 ]; then
+	if [ "$_ct_fired" = 1 ]; then
 		_err=true
 		_note="[timeout: the call was stopped after $_ct_to s and every process it started was killed; narrow the request, or raise the limit with the launcher option --call-timeout]"
 	elif [ "$_cut" = 1 ]; then
