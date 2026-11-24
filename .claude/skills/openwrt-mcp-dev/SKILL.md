@@ -1,0 +1,184 @@
+---
+name: openwrt-mcp-dev
+description: How to change the openwrt-mcp server itself – add or change a tool, an audit check, a helper in server/*.sh, the launcher bin/openwrt-mcp, or the tests – so that it stays POSIX sh on busybox 1.33+, read-only, safe on a compromised router and green on all four OpenWrt test images. Use this for any code, test or doc change in this repository (new tool, new audit finding, output format, redaction rule, bug in a handler, CI failure, shellcheck warning), even for small fixes, and before reviewing a diff of server/ or tests/. German triggers too: neues Werkzeug, Check hinzufügen, Server ändern, Test schreiben, CI rot.
+---
+
+# Working on openwrt-mcp
+
+The server is one POSIX sh script made from `server/NN-name.sh`, joined in name order by
+`bin/openwrt-mcp` (and by the test harness), copied to `/tmp` on the router and run there
+over SSH. It must work on every OpenWrt from 21.02 (busybox 1.33 ash and awk) to 25.12,
+on GL.iNet firmware, and on a router that may already be compromised.
+
+Read before changing:
+
+- The module contract at the top of `server/00-core.sh` (lines 1–70): what a module may
+  call, which globals it may read, how a call runs. Use only those helpers from core.
+- `server/05-lib.sh` for shared readers (`lib_sockets`, `lib_procs`, `lib_fd_inodes`,
+  `lib_rom_ok`, `lib_upper`, `lib_ubus`, `lib_uci_dump`). Their output formats are a
+  contract between modules: extend, never change.
+- The tool's section in `docs/tools.md`. It is the spec; keep it true.
+- `docs/decisions.md` for why things are the way they are (in German).
+
+## Layout
+
+| File | Contents |
+| --- | --- |
+| `00-core.sh` | protocol loop, argument checks, output cap, timeouts, trusted PATH, `redact`, `server_info` |
+| `05-lib.sh` | shared readers |
+| `10-system.sh` | `system_info`, `processes`, `services`, `packages`, `logs`, `kernel_modules`, `uci` |
+| `20-network.sh` | `network`, `connections`, `firewall` |
+| `30-files.sh` | `read_file`, `list_dir`, `find_files`, `file_hash` |
+| `40-forensics.sh` | `overlay_diff`, `persistence`, `users_auth` |
+| `50-audit.sh` | `audit` and its checks |
+| `90-exec.sh` | `exec` – must stay the last registered tool (a test checks it) |
+| `99-main.sh` | `mcp_main` – must stay the last file |
+
+Tools are listed in registration order. A new read-only tool goes into the module it
+belongs to; a new module gets a number between the existing ones and below 90.
+
+## Adding a tool
+
+```sh
+mcp_register my_tool <<'EOF'
+{"name":"my_tool","title":"Short title",
+"description":"What it shows, where the data comes from, when to use it instead of another tool. Written for the model that calls it.",
+"inputSchema":{"type":"object","properties":{
+"path":{"type":"string","description":"...","default":"/"},
+"max_results":{"type":"integer","description":"... 1 to 2000. Default 200.","default":200,"minimum":1,"maximum":2000}},
+"additionalProperties":false},
+"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+EOF
+tool_my_tool() {
+	arg _mt_path path /
+	arg_int _mt_max max_results 200 1 2000 || return
+	have ubus || { echo "ubus: not available"; return 0; }
+	section "Something"
+	rd /etc/something | redact
+	return 0
+}
+```
+
+- The JSON is checked by the core: unknown arguments, JSON types and `required` are
+  rejected before the handler runs. Ranges are checked by `arg_int` in the handler.
+  Always `"additionalProperties":false`.
+- The handler runs in a subshell in an emptied `$MCP_TMP/work`; write scratch files there
+  with relative names. It prints plain text, never reads stdin, returns 0. A non-zero
+  return or `tool_error "msg"; return` sets `isError`.
+- Prefix the handler's variables with a short module/tool tag (`_x_`, `_mt_`, `_inv_`).
+  POSIX sh has no `local`, and the code does not use it.
+- Update `README.md` (tools table), `docs/tools.md` (the module's section, with
+  arguments, defaults, what it reads and its limits), and add tests.
+
+## Rules that keep it correct on a real router
+
+**Portability (busybox 1.33 ash/awk up to current).**
+- POSIX sh only: no arrays, `[[ ]]`, `local`, `$'..'`, `${var//}`, process substitution,
+  `echo -e`. Use `printf`.
+- busybox awk: no `var (expr)` concatenation with a space before a parenthesis (1.33
+  parses it as a function call), `gsub` replacement escapes differ between 1.33 and
+  1.37, strings end at NUL, `substr` is O(n). For binary data go through `hexdump`
+  numbers, as `_mcp_json_text` does.
+- Optional programs (`ubus`, `uci`, `nft`, `iptables-save`, `opkg`/`apk`, `iwinfo`, `wg`,
+  `ip -d`, `readlink -f`, `hexdump`) are checked with `have` and their absence is
+  printed as "X: not available" with the reason, never as an error.
+- Only `busybox` and `jsonfilter` may be assumed.
+
+**Read-only and safe.**
+- Write only below `$MCP_TMP`. No `uci set/commit`, no service restarts, no network
+  traffic, nothing that creates lock or cache files (`opkg list-changed-conffiles` writes
+  a lock, `apk audit` without `--no-cache` creates `/tmp/cache/apk`). Legacy
+  `iptables-save` loads table modules, so it runs only when `/proc/net/ip_tables_names`
+  lists tables.
+- Read files with `rd`, never plain `cat`, when the path comes from config, an argument
+  or the filesystem: `rd` refuses FIFOs, devices and links into `/proc`, `/sys`, `/dev`
+  that would block or leak.
+- Wrap anything that can hang (ubus, external programs on odd paths) in
+  `run_timeout SECS cmd` or use `lib_ubus`.
+- Never call `netstat` or `ss`: sockets come from `/proc` via `lib_sockets`. The
+  gl-helper malware replaces `netstat`, and running it starts the malware.
+- Trust: the core puts the image's busybox first in `PATH`. Do not call programs by
+  absolute overlay paths (`/usr/bin/x`) when the applet would do; that bypasses it.
+
+**Secrets.** Pipe any output that can contain configuration, command lines, environment
+or file content through `redact`. If you add a new kind of secret name, extend `redact`
+in core and its test in `tests/test_contract.py`/`test_core.py`, and document it in
+`docs/tools.md` §2.
+
+**Output for a model with a byte cap.** Results are cut at `MCP_MAX_OUTPUT` (60000).
+Print what matters most first (flags, findings, changed items), the long unremarkable
+lists last, so a cut loses only the tail. Offer `offset`/`limit` or `max_results` when
+output can grow with the device. Say limits in the output ("stopped after 20000
+entries") instead of silently truncating. Compare with the image by content
+(`in_rom`, `rom_path`, size then SHA-256), and only when `lib_rom_ok`; otherwise print a
+note, not a flag on every file.
+
+**Audit checks.** A new check gets a stable id `category.name`, a severity, a confidence
+statement, at most 25 evidence lines, why it matters and what to do. Report each thing in
+exactly one check. A check that cannot run goes to "Could not check" with the reason.
+Leave out the server's own processes (`MCP_CALL_TAG`) and what the firmware wrote at
+first boot (decision 1.11). Add the row to the audit table in `docs/tools.md` §4.
+
+## Tests
+
+`tests/mcp_client.py` starts an OpenWrt rootfs container per test class and talks MCP to
+the server. Pattern:
+
+```python
+from mcp_client import OpenWrtTestCase, needs_container
+
+class TestMyTool(OpenWrtTestCase):
+    def test_basic(self):
+        text = self.tool_ok("my_tool", path="/etc")
+        self.assertIn("== Something", text)
+
+    @needs_container
+    def test_against_fixture(self):
+        self.sh("mkdir -p /fixture/rom/etc /fixture/rom/bin && echo x >/fixture/rom/etc/a")
+        text, err = self.tool("my_tool", env={"MCP_ROM": "/fixture/rom"}, path="/etc")
+        self.assertFalse(err, text)
+```
+
+- `self.sh` runs inside the container, `self.tool` returns `(text, is_error)`, `env=`
+  gives a fresh server session with those variables (`MCP_ROM`, `MCP_UPPER`,
+  `MCP_PROC`, `MCP_FIRSTBOOT_CTIME=0` exist for fixtures).
+- Test errors and edge cases, not just the happy path: bad arguments (`isError` plus the
+  message), missing optional programs, missing `/rom`, a hostile file (FIFO, link into
+  `/proc`, newline or control characters in a name), output over the cap.
+- Anything that writes or needs fixtures is `@needs_container`: with
+  `OPENWRT_MCP_TARGET` set the suite runs against a real router and must stay read-only
+  there; the harness skips every request that names `exec`.
+- Under qemu emulation (amd64 image on Apple silicon) `/proc/PID/exe` is the emulator;
+  process checks use `MCP_PROC` fixtures for that.
+
+## Before you say it is done
+
+Run these and report what they printed, not what you expect:
+
+```sh
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -s sh server/*.sh
+docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable bin/openwrt-mcp
+bin/openwrt-mcp --build "$TMPDIR/openwrt-mcp.sh" && sh -n "$TMPDIR/openwrt-mcp.sh"
+docker run --rm -v "$TMPDIR/openwrt-mcp.sh:/s.sh:ro" openwrt/rootfs:x86-64-21.02.7 sh -n /s.sh
+python3 -W ignore -m unittest discover -s tests -p 'test_<module>.py' -v   # quick, image 24.10.4
+for v in 21.02.7 23.05.5 24.10.4 25.12.0; do
+  OPENWRT_IMAGE=openwrt/rootfs:x86-64-$v python3 -W ignore -m unittest discover -s tests
+done
+```
+
+The oldest image (21.02.7, busybox 1.33) is the one that catches portability mistakes;
+never skip it. A `# shellcheck disable=SCxxxx` needs a comment saying why (see the ones
+in `90-exec.sh`).
+
+Never run tests or `exec` against a router the user has not named; `OPENWRT_MCP_TARGET`
+is for the user's own device and only for read-only tests.
+
+## Docs and commits
+
+- `docs/tools.md` describes behaviour, arguments, defaults and limits in plain English.
+  `README.md` keeps the short tool table in sync.
+- A design decision (a trade-off someone will later ask about) gets the next number in
+  `docs/decisions.md`, in German, one row: question, decision.
+- Commit subjects in English, `area: what changed` or a plain sentence, no trailing
+  period, e.g. `persistence: no RAM-disk marker for links that live on the RAM disk
+  themselves`. Tests and docs can go in the same commit as the change or right after.
