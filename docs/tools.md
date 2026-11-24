@@ -752,9 +752,9 @@ procd reload what depends on it.
 | `package` | string, required | | file name in `/etc/config`: letters, digits, `_`, `-`, not starting with `-`; the file must exist |
 | `changes` | array, required | | 1 to 100 operations `{"op", "path", "value"}`, applied in order |
 | `dry_run` | boolean | false | only show what would change; nothing is written |
-| `reload` | boolean | true | after the commit, let procd reload the services whose configuration changed |
+| `reload` | boolean | true | after the commit, send procd the `config.change` event for this package |
 | `confirm` | boolean | false | needed for risky changes (below), set only after the user agreed |
-| `timeout` | integer 1–300 | 30 | seconds for the reload step (`reload_config`) |
+| `timeout` | integer 1–300 | 30 | seconds for the reload step (the ubus event) |
 
 Operations (`path` is relative to the package; a section is a name of letters, digits
 and `_`, or `@type[N]` with N up to 4 digits, negative counts from the end, so
@@ -772,17 +772,28 @@ and `_`, or `@type[N]` with N up to 4 digits, negative counts from the end, so
 Order of work:
 
 1. **Validation** of every operation (op, path syntax, `value` present exactly where
-   needed and a JSON string, no members other than `op`, `path`, `value`). Values are
+   needed and a JSON string, no members other than `op`, `path`, `value`). The array is
+   read from a file, not from one argv word, so large requests work (a request
+   jsonfilter cannot parse is reported as `changes could not be read as a JSON array`).
+   Values are
    passed to uci as one argv word each, never through the shell: spaces, quotes, `;`,
    `$()`, backticks arrive literally. A value with a line break (`\n`, `\r`) is refused:
    uci would store it, but `uci show`, `reload_config` and every line-based reader
    (including this server's) would misread it.
 2. **Risk check.** Without `confirm: true` a real run is refused with an error that names
    the risk, shows the plan and asks to get the user's agreement and resend with
-   `confirm: true`. Risky: every change to the packages `network`, `firewall`,
-   `wireless`, `dropbear`, `uhttpd`, `nginx`, `rpcd`, `oui-httpd`, `wan-access`, `rtty`,
-   `glconfig`, `tailscale`, `zerotier` (they can cut off access to the router or expose
-   it); a change of `system` option `ttylogin` (login on the serial console); every
+   `confirm: true`. Risky: every change to a package that can cut off access to the
+   router or expose it:
+   - network, addresses and Wi-Fi: `network`, `dhcp`, `wireless`;
+   - firewall and WAN access: `firewall`, `wan-access`;
+   - logins and web UIs: `dropbear`, `uhttpd`, `nginx`, `rpcd`, `oui-httpd`;
+   - remote access, VPN and cloud: `rtty`, `gl-cloud`, `gl_ddns`, `tailscale`,
+     `zerotier`, `wireguard`, `wireguard_server`, `openvpn`, `ovpnserver`, `mptun`,
+     `gl_s2s`;
+   - port mapping and file sharing: `upnpd`, `samba`, `samba4`, `ksmbd`, `nas`;
+   - router mode: `glconfig`;
+
+   also a change of `system` option `ttylogin` (login on the serial console); every
    `delete` of a whole section, in any package. A dry run needs no confirm and lists the
    risk under `== Risk`.
 3. **Uncommitted changes** of someone else in the package (`uci changes PKG` not empty):
@@ -796,22 +807,26 @@ Order of work:
 5. **Dry run** stops here: `== Dry run: lines that would change (nothing was written)`
    with `config PKG: N removed, M added` and the `uci show` lines (`  - ` before,
    `  + ` after, redacted, at most 200).
-6. **Real run**: `lib_cfg_snapshot`, the operations with uci (if one fails now, `uci
-   revert PKG` and an error: nothing committed), `uci commit PKG`, then the reload:
+6. **Real run**, with umask 022 (the server's own 077 must not reach files uci writes or
+   services procd reloads): `lib_cfg_snapshot`, the operations with uci (if one fails
+   now, `uci revert PKG` and an error: nothing committed), `uci commit PKG`, then the
+   reload:
    - procd not answering on ubus (no socket, as in containers): `NOT APPLIED: the change
      is committed ... but no service was reloaded`;
-   - `reload_config` present and `/var/run/config.md5` there (written at boot): it runs
-     under `timeout`; procd reloads every service whose configuration changed since the
-     last `reload_config`, in the background;
-   - otherwise (no `reload_config`, or no md5 file to compare against) the server sends
-     procd the `config.change` event for the package itself (`ubus call service event`),
-     which is what `reload_config` does per changed package.
+   - otherwise the server sends procd the `config.change` event for this package only
+     (`ubus call service event`, under `timeout`), and procd reloads the services that
+     watch it, in the background. `reload_config` is not used: it reloads every package
+     whose committed configuration differs from what procd last applied, so a harmless
+     change could apply someone else's committed `network` change without confirm. (A
+     later `reload_config` may reload this package once more; that is harmless.)
    `reload: false` commits only and says so.
 
 Output: `== Plan: N operation(s) on /etc/config/PKG` (one line per operation, `N op
 pkg.path='value'`, redacted), then for a real run `== Applied` (`committed ...`, new
-section names), `== Reload` (`reload_config`, `procd/ubus`, `result` lines) and `== Changes
-in /etc/config` (`lib_cfg_changes`, at most 200 lines per package). On GL.iNet firmware
+section names), `== Reload` (`procd/ubus` and `result` lines) and `== Changes in
+/etc/config` (`lib_cfg_changes`, at most 200 lines per package). Plan and dry-run lines
+longer than 500 characters are cut there (`... [N characters]`); the configuration gets
+the whole value. On GL.iNet firmware
 (`/etc/glversion`) a last `== Note` says that `glinet_api` keeps the GL web UI in sync and
 that GL services may overwrite or ignore direct uci edits of GL-managed packages.
 
@@ -826,19 +841,34 @@ packages; `rename` and `reorder` are not offered.
 | `service` | string, required | | script name in `/etc/init.d` (letters, digits, `_ . -`, not starting with `.` or `-`, no path); it must be a regular file |
 | `action` | string, required | | `status`, `start`, `stop`, `restart`, `reload`, `enable`, `disable` |
 | `confirm` | boolean | false | needed for risky actions |
-| `timeout` | integer 1–300 | 30 | seconds, then the init script and everything it started in the foreground are killed |
+| `timeout` | integer 1–300 | 30 | seconds to wait for the init script; one still running then is reported and left running, never killed |
 
 - `status` reads only: `enabled  yes (/etc/rc.d/S..NAME)` or `no`, and `running` from
   procd (`ubus call service list`): number of running instances, `no`, or `unknown
   (ubus or procd not available)`.
-- Other actions run `/etc/init.d/NAME ACTION` from `/` with stdin `/dev/null` and print
-  its output (redacted, at most 200 lines), `[exit N]` (a non-zero exit is not an error
-  result) or `[timeout after N s]` (error result), then `== Status of NAME`. The script
-  runs without the call's `MCP_CALL_TAG`, so daemons it starts outside procd are not
-  killed with the call and are not hidden from `audit`.
-- Risky (need `confirm: true`): `stop`, `restart`, `disable` of `network`, `firewall`,
-  `dropbear`, `sshd`, `uhttpd`, `nginx`, `rpcd`, `ubus`, `odhcpd`, `dnsmasq`,
-  `gl-ngx-session`, `wpad`, `hostapd`, `tailscale`, `zerotier`, `openvpn`.
+- Other actions run `/etc/init.d/NAME ACTION` **detached from the call**: orphaned by a
+  double fork, in a session of its own where `setsid` exists (not on 21.02), without
+  the call's `MCP_CALL_TAG`, stdin `/dev/null`, umask 022, from `/`. Neither the call
+  limit nor the end of the server (SSH dropped, client gone) can kill it halfway, as it
+  could otherwise kill `network restart` between stop and start. Output and exit status
+  go to a private directory `$MCP_TMP/svc.XXXXXX`; whichever side finishes last (the call
+  or the job) removes it, and the server's exit removes it with `$MCP_TMP` (the job then
+  goes on without writing its result). Daemons the script starts outside procd are
+  neither killed with the call nor hidden from `audit`.
+- The call waits up to `timeout` (counted from the start of the call), then prints the
+  output (redacted, at most 200 lines) and `[exit N]` (a non-zero exit is not an error
+  result), or `[still running after N s: the action goes on in the background and was
+  NOT killed; ...]` (error result), then `== Status of NAME` and `== Changes in
+  /etc/config` (`lib_cfg_changes` against a snapshot taken before the action: init
+  scripts can write uci).
+- Risky, one rule: **every action but `status`** on a service that carries access or
+  the network, or opens the router to the outside, needs `confirm: true` (stopping cuts
+  access, starting or enabling can expose the router, `reload` and `restart` apply
+  whatever configuration is committed): `network`, `firewall`, `dnsmasq`, `odhcpd`,
+  `wpad`, `hostapd`, `ubus`, `rpcd`, `dropbear`, `sshd`, `uhttpd`, `nginx`,
+  `gl-ngx-session`, `rtty`, `tailscale`, `zerotier`, `gl-cloud`, `gl_cloud`, `openvpn`,
+  `wireguard`, `wgserver`, `wireguard_server`, `ovpnserver`, `mptun`, `miniupnpd`,
+  `samba4`, `smbd`, `ksmbd`, `vsftpd`, `ttyd`, `ddns`, `gl_ddns`.
 - Refused for every action but `status`: `boot`, `done`, `umount`, `sysfixtime` (they
   run only at boot or shutdown; `umount` unmounts the filesystems, disabling `boot`
   breaks the next boot). `sysntpd` is an ordinary daemon and allowed.
