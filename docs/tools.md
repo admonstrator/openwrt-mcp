@@ -67,7 +67,11 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
 - `run_timeout SECS CMD...`: the limit kills the whole process tree of CMD (stopped
   first with SIGSTOP until the set stops growing, then SIGKILL; found through
   `/proc/*/stat`, no `setsid` or `timeout` needed). Returns 124 only when the limit hit
-  (`_rt_fired=1`), otherwise CMD's own status. CMD's stdin is /dev/null.
+  and something was killed (`_rt_fired=1`), otherwise CMD's own status. CMD's stdin is
+  /dev/null. The watchdog never holds the caller's stdout, so `$(run_timeout ...)` and
+  `run_timeout ... | awk` return when CMD ends. Whether the watchdog fired or was
+  cancelled is decided by a lock directory in `$MCP_TMP` (`mkdir`, first one wins), not by
+  signal timing; a cancelled watchdog is frozen and killed together with its `sleep`.
 - `json_quote STRING` keeps a trailing newline of STRING (before, it was dropped);
   `json_str` still drops one trailing newline of its input.
 - `rd` also refuses `/proc/kmsg` and `trace_pipe` files (regular files that block).

@@ -195,6 +195,23 @@ class TestLimits(OpenWrtTestCase):
         self.assertEqual(live(self.container.procs(), "sleep 30"), [])
 
     @needs_container
+    def test_run_timeout_at_the_limit(self):
+        # the command ends just when the limit hits: either it counts as finished
+        # (its own status, not fired) or as timed out (124, fired), never a mix, and no
+        # alarm leaves its lock directory or its sleep behind
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            for i in 1 2 3 4 5 6 7 8; do
+                run_timeout 1 sh -c 'sleep 1; exit 7'; echo "$?:$_rt_fired"
+            done
+            ls "$MCP_TMP" | grep -c '^alarm' ; true
+            """, check=False)
+        lines = out.split()
+        for r in lines[:-1]:
+            self.assertIn(r, ("7:0", "124:1"))
+        self.assertEqual(lines[-1], "0")
+
+    @needs_container
     def test_call_timeout(self):
         env = {"MCP_CALL_TIMEOUT": "3"}
         s = self.session(env)
