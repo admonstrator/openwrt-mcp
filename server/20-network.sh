@@ -16,7 +16,7 @@ _net_procs() { [ -f procs.tsv ] || lib_procs >procs.tsv; }
 # running processes whose name matches the extended regex $1: "pid name cmdline"
 _net_running() {
 	_net_procs
-	RE=$1 awk -F '\t' '$7 == 0 && $8 ~ ENVIRON["RE"] { printf "  pid %-6s %-16s %s\n", $1, $8, substr($10, 1, 300); n++ } END { if (!n) print "  none running" }' procs.tsv
+	RE=$1 awk -F '\t' '$7 == 0 && $8 ~ ENVIRON["RE"] { printf "  pid %-6s %-16s %s\n", $1, $8, substr($10, 1, 300); n++ } END { if (!n) print "  none running" }' procs.tsv | redact
 }
 
 # dnsmasq config files, each once (/var is a link to /tmp on OpenWrt)
@@ -736,6 +736,13 @@ tool_firewall() {
 	for _c in iptables-save ip6tables-save; do
 		have "$_c" || continue
 		_any=1
+		# with legacy iptables, *-save loads the table modules it asks for: only call it
+		# when the kernel already has tables
+		case $_c in iptables-save) _tn=/proc/net/ip_tables_names _tf=iptables ;; *) _tn=/proc/net/ip6_tables_names _tf=ip6tables ;; esac
+		if ! grep -q . "$_tn" 2>/dev/null; then
+			echo "$_c: no $_tf tables loaded ($_tn is empty or missing)"
+			continue
+		fi
 		echo "$_c:"
 		run_timeout 20 "$_c" >rs.txt 2>&1
 		_rc=$?
