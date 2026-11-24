@@ -346,7 +346,7 @@ au_auth() {
 au_integrity() {
 	_up=
 	au_fbconf
-	if _up=$(fx_upper) && fx_rom_ok; then
+	if _up=$(lib_upper) && lib_rom_ok; then
 		fo_overlay "$_up" / >"$AU/ov"
 		[ -e "$MCP_TMP/overlay.cut" ] && au_skip integrity "the overlay holds more than $FO_OVERLAY_MAX entries; the scan stopped there, so the overlay checks are incomplete (overlay_diff with path scans one subtree)"
 		_ev='{ x = $12 ": " (($6 == "l") ? "symlink -> " $13 : $10 " bytes, mode " $7) ", mtime " $11; if ($5 != "-") x = x "; " $5; if ($14 != "-") x = x "; package " $14 " (" $15 ")"; print x }'
@@ -447,7 +447,7 @@ au_integrity() {
 		*)
 			if [ ! -e "$_exe" ]; then
 				_gone=$((_gone + 1))
-			elif fx_rom_ok && ! in_rom "$_exe"; then
+			elif lib_rom_ok && ! in_rom "$_exe"; then
 				printf '%s\t%s\t%s\n' "$_exe" "$_pid" "$_c" >>"$AU/p.cand"
 			fi
 			;;
@@ -469,7 +469,7 @@ au_integrity() {
 		"Processes running from /tmp, /var or /dev/shm" \
 		"Programs belong to the firmware or to packages. One that runs from the RAM disk was put there after boot." \
 		"Inspect the file with file_hash and read_file view=strings, and the process with the processes and connections tools." <"$AU/p.tmp"
-	if fx_rom_ok; then
+	if lib_rom_ok; then
 		if [ -s "$AU/p.cand" ]; then
 			cut -f1 "$AU/p.cand" | sort -u | tr '\n' '\0' | fx_ls | fx_cmp "" 1 | fx_pkg >"$AU/p.rec"
 		else
@@ -536,7 +536,7 @@ au_integrity() {
 			_bad=0
 			for _l in $(printf '%s' "${_v#LD_PRELOAD=}" | tr ':' ' '); do
 				case $_okl in *" $_l "*) continue ;; esac
-				if fx_rom_ok; then
+				if lib_rom_ok; then
 					_r=$(rom_path "$_l")
 					if [ -f "$_l" ] && [ ! -L "$_r" ] && [ -f "$_r" ] && fx_same "$_l" "$_r"; then
 						_okl="$_okl$_l "
@@ -561,7 +561,7 @@ au_integrity() {
 		"A library that is not an unchanged part of the image is preloaded into programs" \
 		"Preloading injects code into every program that starts: the standard userland rootkit technique. The one legitimate use on OpenWrt, procd's /lib/libsetlbf.so for services that log their output, is not listed when the library equals the image." \
 		"Inspect the named library with file_hash and read_file view=strings, find what sets it (persistence tool), then remove it." <"$AU/pre"
-	if [ -s "$AU/pre.ok" ] && ! fx_rom_ok; then
+	if [ -s "$AU/pre.ok" ] && ! lib_rom_ok; then
 		au_skip integrity.ld_preload "$(wc -l <"$AU/pre.ok") processes preload /lib/libsetlbf.so (procd's helper for services that log their output); without a firmware image it could not be verified"
 	fi
 
@@ -591,7 +591,7 @@ au_persistence() {
 	rm -f "$MCP_TMP/persist.cut"
 	au_fbconf
 	_ev='{ x = $10 (($11 != "-") ? " -> " $11 : "") ": " $8 " bytes, mode " $5 ", mtime " $9; if ($3 != "-") x = x "; " $3; x = x "; " (($12 == "-") ? "no package owns it" : "package " $12 " (" $13 ")"); print x }'
-	if fx_rom_ok; then
+	if lib_rom_ok; then
 		awk -F'\t' '$2 == "changed" && ($1 == "init" || $1 == "hotplug" || $1 == "inittab" || $1 == "rpcd" || $1 == "luci") && $13 !~ /^upgraded/ && $14 != "firstboot" '"$_ev" "$AU/ps" |
 			au_add high persistence.image_script_changed "high: content compared with the firmware image, and neither written at first boot nor explained by a package upgrade" \
 				"Startup scripts of the firmware image were changed after first boot" \
@@ -649,7 +649,7 @@ au_persistence() {
 		fo_uci dhcp | sed -n "s/^\(dhcp\.[^.]*\.dhcpscript\)='\(.*\)'\$/\2\t\1='\2' (uci dhcp)/p"
 	} >"$AU/dh" 2>/dev/null
 	while IFS="$FX_TAB" read -r _t _line; do
-		if fx_rom_ok && [ -f "$_t" ] && [ -f "$(rom_path "$_t")" ] && fx_same "$_t" "$(rom_path "$_t")"; then
+		if lib_rom_ok && [ -f "$_t" ] && [ -f "$(rom_path "$_t")" ] && fx_same "$_t" "$(rom_path "$_t")"; then
 			continue
 		fi
 		printf '%s\n' "$_line"
@@ -831,8 +831,8 @@ tool_audit() {
 	_host=$(cat /proc/sys/kernel/hostname 2>/dev/null)
 	_desc=$(rd /etc/openwrt_release | sed -n "s/^DISTRIB_DESCRIPTION=['\"]\{0,1\}\([^'\"]*\).*/\1/p" | head -n 1)
 	printf 'Audit of %s (%s%s), %s\n' "${_host:-?}" "${_desc:-unknown release}" "$([ -f /etc/glversion ] && printf ', GL.iNet firmware %s' "$(rd /etc/glversion | head -n 1)")" "$(date '+%Y-%m-%d %H:%M:%S')"
-	if fx_rom_ok; then _i="$MCP_ROM (usable)"; else _i="$MCP_ROM (not usable)"; fi
-	if _u=$(fx_upper); then :; else _u="none found"; fi
+	if lib_rom_ok; then _i="$MCP_ROM (usable)"; else _i="$MCP_ROM (not usable)"; fi
+	if _u=$(lib_upper); then :; else _u="none found"; fi
 	printf 'firmware image: %s | overlay: %s | trusted tools: %s\n' "$_i" "$_u" "$MCP_TRUSTED"
 	printf 'categories: %s\n' "$cats"
 	_n1=$(find "$AU" -name 'f.1.*' | wc -l)

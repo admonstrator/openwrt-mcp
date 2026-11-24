@@ -11,33 +11,8 @@
 # shellcheck disable=SC2034  # used by 40-forensics.sh and 50-audit.sh
 FX_TAB=$(printf '\t')
 
-# The firmware image is usable for comparisons when it holds a system tree.
-fx_rom_ok() {
-	[ -d "$MCP_ROM/etc" ] || [ -d "$MCP_ROM/bin" ] || [ -d "$MCP_ROM/usr" ] || [ -d "$MCP_ROM/lib" ]
-}
-
-# Prints the overlay's upper directory; fails when the device has none. MCP_UPPER wins
-# when it exists; with the default value the upperdir of the root mount and the
-# location some GL.iNet models use are tried too.
-fx_upper() {
-	if [ -d "$MCP_UPPER" ]; then
-		printf '%s\n' "${MCP_UPPER%/}"
-		return 0
-	fi
-	[ "$MCP_UPPER" = /overlay/upper ] || return 1
-	_fu=$(awk '$2 == "/" && $3 == "overlay" {
-		n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^upperdir=/) u = substr(o[i], 10)
-	} END { print u }' /proc/mounts 2>/dev/null)
-	if [ -n "$_fu" ] && [ -d "$_fu" ]; then
-		printf '%s\n' "${_fu%/}"
-		return 0
-	fi
-	if [ -d /userdata/overlay/upper ]; then
-		echo /userdata/overlay/upper
-		return 0
-	fi
-	return 1
-}
+# Whether the firmware image is usable (lib_rom_ok) and where the overlay's upper
+# directory is (lib_upper) comes from server/05-lib.sh, shared with the inventory tools.
 
 # awk library: fx_ls(line) parses one "ls -lnd --full-time" line into F_type (f d l c b
 # p s), F_mode (octal), F_uid, F_gid, F_size (devices: "major,minor"), F_mtime, F_path,
@@ -182,7 +157,7 @@ fx_cmp() {
 	fx_seq=$((${fx_seq:-0} + 1))
 	_ct=$MCP_TMP/cmp.$fx_seq
 	_cc=$2
-	fx_rom_ok || _cc=0
+	lib_rom_ok || _cc=0
 	cat >"$_ct.L"
 	: >"$_ct.R"
 	: >"$_ct.S"
@@ -276,7 +251,7 @@ fx_pkg() {
 	_pt=$MCP_TMP/pkg.$$
 	fx_pkgdb "" >"$_pt.l"
 	: >"$_pt.r"
-	fx_rom_ok && fx_pkgdb "$MCP_ROM" >"$_pt.r"
+	lib_rom_ok && fx_pkgdb "$MCP_ROM" >"$_pt.r"
 	FX_PL="$_pt.l" FX_PR="$_pt.r" awk '
 		BEGIN { FS = "\t"; OFS = "\t" }
 		FILENAME == ENVIRON["FX_PL"] { if ($1 == "F") own[$2] = $3; else lv[$2] = $3; next }
@@ -312,7 +287,7 @@ fx_pkg() {
 # of the device is itself inside the window (not yet set): then nothing can be told.
 FX_FB_SECONDS=3600
 fx_fbwindow() {
-	fx_rom_ok || return 1
+	lib_rom_ok || return 1
 	_fb0=$(find "${MCP_ROM%/}/etc" -xdev -type f -print0 2>/dev/null | fx_ls |
 		awk "$FX_AWK_LS"'{ if (fx_ls($0) && F_mtime > m) m = F_mtime } END { print m }')
 	[ -n "$_fb0" ] || return 1
@@ -682,7 +657,7 @@ tool_list_dir() {
 	else
 		echo "[entries: $total]"
 	fi
-	if ! fx_rom_ok; then
+	if ! lib_rom_ok; then
 		echo "[no usable firmware image at $MCP_ROM: the image column is empty]"
 	fi
 	rm -f "$lst"
@@ -825,7 +800,7 @@ tool_file_hash() {
 	n=$(wc -l <"$lst")
 	[ "$n" -ge 1 ] || { tool_error "paths is empty"; return 1; }
 	[ "$n" -le 50 ] || { tool_error "at most 50 paths per call, got $n"; return 1; }
-	fx_rom_ok || echo "note: no usable firmware image at $MCP_ROM, hashes are not compared"
+	lib_rom_ok || echo "note: no usable firmware image at $MCP_ROM, hashes are not compared"
 	meta=$MCP_TMP/hash.meta
 	# only absolute paths reach ls: anything else could be read as an option
 	grep '^/' "$lst" | tr '\n' '\0' | fx_ls | fx_cmp "" 0 | fx_pkg >"$meta"
@@ -851,7 +826,7 @@ tool_file_hash() {
 			if ($11 != "-") printf "  package  %s (%s)\n", $11, $12; else print "  package  none owns this path"
 			exit }' "$meta"
 		r=$(rom_path "$p")
-		if ! fx_rom_ok; then
+		if ! lib_rom_ok; then
 			:
 		elif [ -L "$r" ]; then
 			echo "  image    DIFFERENT TYPE: the image has a symlink -> $(readlink "$r" 2>/dev/null)"

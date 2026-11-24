@@ -150,17 +150,17 @@ tool_overlay_diff() {
 	arg_int maxp max_priority 5 1 5 || return 1
 	arg_int off offset 0 0 1000000 || return 1
 	arg_int max max_results 200 1 1000 || return 1
-	if ! up=$(fx_upper); then
+	if ! up=$(lib_upper); then
 		echo "No overlay found: $MCP_UPPER does not exist and the root filesystem is not an overlay mount with a visible upper directory."
 		echo "That is normal on x86 images with an ext4 root, on initramfs images and in containers; then there is no separate layer to diff."
-		if fx_rom_ok; then
+		if lib_rom_ok; then
 			echo "The firmware image at $MCP_ROM is usable: list_dir, find_files and file_hash still compare single paths with it."
 		else
 			echo "There is no usable firmware image at $MCP_ROM either, so nothing can be compared with the shipped firmware."
 		fi
 		return 0
 	fi
-	if ! fx_rom_ok; then
+	if ! lib_rom_ok; then
 		echo "Overlay found at $up, but there is no usable firmware image at $MCP_ROM: entries are listed without comparison."
 	fi
 	rec=$MCP_TMP/overlay.rec
@@ -346,7 +346,7 @@ tool_persistence() {
 	done
 	rec=$MCP_TMP/persist.rec
 	fo_persist >"$rec"
-	if fx_rom_ok; then
+	if lib_rom_ok; then
 		echo "Entries are compared with the firmware image at $MCP_ROM: [same] identical, [CHANGED] differs, [new] not in the image, [meta] same content, other mode or owner."
 	else
 		echo "No usable firmware image at $MCP_ROM: entries cannot be marked as changed or new ([-]); judge them by content and mtime."
@@ -486,13 +486,13 @@ fo_accounts() {
 fo_keys() {
 	fo_keyfiles >"$MCP_TMP/keys.files"
 	: >"$MCP_TMP/keys.rom"
-	if fx_rom_ok; then
+	if lib_rom_ok; then
 		while IFS= read -r _kf; do
 			rd "$(rom_path "$_kf")"
 		done <"$MCP_TMP/keys.files" >"$MCP_TMP/keys.rom" 2>/dev/null
 	fi
 	while IFS= read -r _kf; do
-		rd "$_kf" | FX_KF="$_kf" FX_KR="$MCP_TMP/keys.rom" FX_HASROM="$(fx_rom_ok && echo 1 || echo 0)" awk '
+		rd "$_kf" | FX_KF="$_kf" FX_KR="$MCP_TMP/keys.rom" FX_HASROM="$(lib_rom_ok && echo 1 || echo 0)" awk '
 		function b64dec(s,   i, v, bits, c) {
 			BN = 0; v = 0; bits = 0
 			for (i = 1; i <= length(s); i++) {
@@ -624,7 +624,7 @@ tool_users_auth() {
 			print "uid 0 besides root:" ((u0 == "") ? " none" : u0 "  <- full root rights under another name")
 			print "empty passwords:" ((em == "") ? " none" : em)
 		}'
-	fx_rom_ok || echo "(no usable firmware image: accounts cannot be compared with the shipped /etc/passwd)"
+	lib_rom_ok || echo "(no usable firmware image: accounts cannot be compared with the shipped /etc/passwd)"
 
 	section "Authorized SSH keys"
 	keys=$(fo_keys_table)
