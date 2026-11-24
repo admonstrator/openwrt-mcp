@@ -202,6 +202,7 @@ au_exposure_data() {
 }
 
 au_exposure() {
+	au_gl_exposure
 	if [ "$AU_FW" != ok ]; then
 		au_skip "exposure.wan_input_accept, exposure.wan_open_port, exposure.port_forward" "no firewall configuration readable (uci or /etc/config/firewall missing)"
 		return 0
@@ -340,6 +341,84 @@ au_auth() {
 	else
 		au_skip auth.ssh_password_from_wan "no firewall configuration readable, WAN reachability unknown"
 	fi
+	au_gl_auth
+}
+
+# ---------------------------------------------------------------- GL.iNet
+# The GL.iNet checks read uci, files and /proc through the gl_* helpers of
+# 45-glinet.sh; the GL web API is never called (decision 2.5).
+au_gl_exposure() {
+	if ! gl_is; then
+		au_skip "exposure.gl_remote_terminal, exposure.gl_cloud_bound" "not GL.iNet firmware (no /etc/glversion)"
+		return 0
+	fi
+	gl_init
+	_gce=
+	_gcs=
+	if _gcs=$(gl_sec gl-cloud cloud); then _gce=$(gl_get gl-cloud "$_gcs" enable); fi
+	_grs=$(gl_get rtty general ssh_en)
+	_grw=$(gl_get rtty general web_en)
+	{
+		gl_procs rtty | awk -F'\t' '{ print "rtty process pid " $1 " (" $2 "): " (($3 == "") ? "(no command line)" : $3) }'
+		if [ "$_gce" = 1 ] && { [ "$_grs" = 1 ] || [ "$_grw" = 1 ]; }; then
+			printf "gl-cloud.%s.enable='1' (GoodCloud on) with rtty.general.ssh_en='%s', rtty.general.web_en='%s'\n" "$_gcs" "${_grs:-unset}" "${_grw:-unset}"
+		fi
+	} | au_add medium exposure.gl_remote_terminal "high for what is listed: the process table and /etc/config/gl-cloud and rtty; whether someone uses the cloud session is not visible here" \
+		"A remote root shell through GL.iNet's cloud relay is possible" \
+		"rtty connects out to GL.iNet's relay server and gives whoever controls the GoodCloud account a root terminal (SSH) or the web interface, past the firewall and without an open port. Intended when you manage the router through GoodCloud; otherwise an open door that rests on the security of a cloud account." \
+		"If you do not use GoodCloud remote access: switch rtty SSH and web access off, or GoodCloud altogether (web interface, Applications > GoodCloud), then check that no rtty process is left (processes tool)."
+	if [ "$_gce" = 1 ]; then
+		_gcu=$(gl_get gl-cloud "$_gcs" username)
+		_gcm=$(gl_get gl-cloud "$_gcs" email)
+		_gct=$(gl_get gl-cloud "$_gcs" bindtime)
+		if [ -n "$_gcu$_gcm$_gct" ]; then
+			printf "gl-cloud.%s: enable='1', username '%s', email '%s', bindtime '%s', server '%s'\n" "$_gcs" "${_gcu:--}" "${_gcm:--}" \
+				"${_gct:--}" "$(gl_get gl-cloud "$_gcs" server || echo -)" | redact
+		fi
+	fi | au_add low exposure.gl_cloud_bound "high: read from /etc/config/gl-cloud" \
+		"The router is bound to a GoodCloud account" \
+		"A bound router reports to GL.iNet's cloud and can be managed from that account: settings, firmware, and remote access when it is switched on. Fine when the account is yours." \
+		"Check that the account is yours; if not, unbind the router in the web interface and change the root password."
+}
+
+au_gl_auth() {
+	if ! gl_is; then
+		au_skip "auth.gl_no_auth_methods, auth.gl_admin_accounts, auth.gl_console_login" "not GL.iNet firmware (no /etc/glversion)"
+		return 0
+	fi
+	gl_init
+	if ! gl_load oui-httpd; then
+		au_skip "auth.gl_no_auth_methods, auth.gl_console_login" "no /etc/config/oui-httpd"
+	elif ! gl_rom oui-httpd; then
+		au_skip "auth.gl_no_auth_methods, auth.gl_console_login" "no oui-httpd configuration in a usable firmware image at $MCP_ROM to compare with"
+	else
+		gl_noauth | awk -F'\t' '$3 == "ADDED" { print "/etc/config/oui-httpd: " $1 "." $2 " runs without login; the image does not list it" }' | redact |
+			au_add high auth.gl_no_auth_methods "high: the no-auth-methods sections of /etc/config/oui-httpd compared with the same file in the firmware image" \
+				"Web API methods that run without login, beyond those of the firmware" \
+				"GL.iNet's web server (oui-httpd) runs the listed object.method for anyone who reaches the web interface, without a session. The firmware allows only a few harmless ones (language, time zones, first setup); an added method, a reboot, a password or a file call above all, is a backdoor into the web API." \
+				"Remove the added method from /etc/config/oui-httpd (the no-auth-methods section), restart oui-httpd, and find out who added it (overlay_diff, persistence)."
+		_gcl=$(gl_get oui-httpd main console_disabled)
+		_gci=$(gl_get oui-httpd main console_disabled rom)
+		if [ "$_gci" = 1 ] && [ "$_gcl" != 1 ]; then
+			printf "oui-httpd.main.console_disabled='%s' (image: '1'): gl-ngx-session links /bin/login to busybox, the serial console asks for root's password\n" "${_gcl:-unset}"
+		fi | au_add low auth.gl_console_login "high: read from /etc/config/oui-httpd and the image's copy" \
+			"Login on the serial console is switched on" \
+			"The firmware ships with the serial console login off. With console_disabled off, anyone with physical access to the board's serial pins gets a login prompt for root." \
+			"Unless you use the serial console: uci set oui-httpd.main.console_disabled='1'; uci commit oui-httpd, then restart gl-ngx-session."
+	fi
+	gl_accounts >"$AU/gla"
+	case $? in
+	0)
+		awk -F'\t' '$1 != "root" { print "/etc/oui/oui.db account \047" $1 "\047 (acl " (($2 == "") ? "-" : $2) ")" }' "$AU/gla" |
+			au_add medium auth.gl_admin_accounts "high: read from a copy of /etc/oui/oui.db (table account)" \
+				"Extra admin accounts of the GL.iNet web interface" \
+				"Besides root, these accounts log in to the web interface and use the API within their acl. An account nobody remembers creating keeps access after the root password was changed." \
+				"Delete the accounts you do not know (web interface, System > Administration, or the GL API) and check what they changed."
+		;;
+	2) au_skip auth.gl_admin_accounts "sqlite3: not available, /etc/oui/oui.db (extra web interface accounts) cannot be read" ;;
+	3) au_skip auth.gl_admin_accounts "no /etc/oui/oui.db" ;;
+	*) au_skip auth.gl_admin_accounts "table account of /etc/oui/oui.db could not be read: $(head -n 1 "$GLD/acct.err" 2>/dev/null)" ;;
+	esac
 }
 
 # ---------------------------------------------------------------- integrity
@@ -694,6 +773,207 @@ au_persistence() {
 		"Commands that run by themselves from cron, rc.local or changed startup files" \
 		"Scheduled reboots and DDNS updates live here, and so do the download-and-run lines of malware. Lines marked with an arrow fetch something, pipe into a shell or use the RAM disk." \
 		"Confirm each line is yours. Remove the others, then look at what they started (processes) and fetched (find_files in /tmp)." <"$AU/hooks"
+	au_cron_live
+}
+
+# ---------------------------------------------------------------- live crontabs
+# au_cron_word WORD: how a program named in a cron line is judged, one line:
+#   C  word  class  detail  path
+# class: builtin, image, ram, notfound, unresolved, or cand (a file to compare with the
+# image; au_cron_live turns it into image, changed, added or noimage). Bare names are
+# looked up in crond's PATH.
+au_cron_word() {
+	case $1 in
+	. | : | '[' | cd | echo | eval | exit | export | false | printf | pwd | read | return | set | shift | test | trap | true | type | ulimit | umask | unset | wait | kill | local)
+		printf 'C\t%s\tbuiltin\ta shell builtin\t-\n' "$1"
+		return 0
+		;;
+	/*) _cwp=$1 ;;
+	*/*)
+		printf 'C\t%s\tunresolved\ta relative path\t-\n' "$1"
+		return 0
+		;;
+	*)
+		_cwp=
+		for _cwd in /usr/sbin /usr/bin /sbin /bin; do
+			if [ -e "$_cwd/$1" ] || [ -L "$_cwd/$1" ]; then
+				_cwp=$_cwd/$1
+				break
+			fi
+		done
+		if [ -z "$_cwp" ]; then
+			printf 'C\t%s\tnotfound\tnot found in /usr/sbin, /usr/bin, /sbin or /bin\t-\n' "$1"
+			return 0
+		fi
+		;;
+	esac
+	if fo_ramdisk "$_cwp"; then
+		_cwr=$(readlink -f "$_cwp" 2>/dev/null) || _cwr=
+		_cwx=
+		[ -e "$_cwp" ] || _cwx=" and does not exist now"
+		printf 'C\t%s\tram\t%s is on the RAM disk%s\t%s\n' "$1" "${_cwr:-$_cwp}" "$_cwx" "$_cwp"
+		return 0
+	fi
+	if [ ! -e "$_cwp" ]; then
+		printf 'C\t%s\tnotfound\t%s does not exist\t-\n' "$1" "$_cwp"
+		return 0
+	fi
+	case $(readlink -f "$_cwp" 2>/dev/null) in
+	"${MCP_ROM%/}"/*)
+		printf 'C\t%s\timage\tpart of the firmware image\t%s\n' "$1" "$_cwp"
+		return 0
+		;;
+	esac
+	printf 'C\t%s\tcand\t-\t%s\n' "$1" "$_cwp"
+}
+
+# What the running crond reads outside /etc/crontabs (fo_cron_dirs; GL.iNet:
+# /tmp/gl_crontabs, rebuilt at boot). Each active line is judged by the programs it
+# runs: the first word of every command (after "." or "source" the file it reads, after
+# an interpreter the script it runs); a name the line's sourced file defines as a
+# function counts as that file. Lines that also stand in /etc/crontabs are left to
+# persistence.user_autostart, so that each line is reported once.
+au_cron_live() {
+	_cw=$AU/cl
+	mkdir -p "$_cw"
+	fo_cron_dirs >"$_cw/dirs"
+	fo_cron_live_files "$_cw/dirs" >"$_cw/files"
+	awk -F'\t' '$1 == "cron" && ($4 == "f" || $4 == "l") && $10 != "/etc/crontabs/cron.update" { print $10 }' "$AU/ps" |
+		while IFS= read -r _p; do
+			fx_refuse "$_p" >/dev/null && continue
+			rd "$_p" | tr -d '\000\r'
+		done >"$_cw/etc"
+	: >"$_cw/idx"
+	_n=0
+	while IFS="$FX_TAB" read -r _ _p _t _; do
+		case $_t in f | l) ;; *) continue ;; esac
+		fx_refuse "$_p" >/dev/null && continue
+		_n=$((_n + 1))
+		rd "$_p" | tr -d '\000\r' | head -n 1000 >"$_cw/raw.$_n"
+		redact <"$_cw/raw.$_n" | fx_redact_kv "$_p" >"$_cw/red.$_n"
+		printf '%s\t%s\n' "$_n" "$_p" >>"$_cw/idx"
+	done <"$_cw/files"
+	# L id text: one per active line (text redacted); W id kind word: P program, S
+	# sourced file, U not resolvable (a shell expansion)
+	FX_E="$_cw/etc" FX_I="$_cw/idx" FX_W="$_cw" awk '
+	function norm(s) { gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
+	function words(cmd, id,   segs, ns, k, t, nt, i, w, first, src, interp, skip, b) {
+		gsub(/[0-9]*>&[0-9-]+/, " ", cmd); gsub(/&>/, ">", cmd)
+		gsub(/[|&;()`]/, ";", cmd)
+		ns = split(cmd, segs, ";")
+		for (k = 1; k <= ns; k++) {
+			nt = split(segs[k], t, /[ \t]+/)
+			first = ""; src = 0; interp = 0; skip = 0
+			for (i = 1; i <= nt; i++) {
+				w = t[i]; gsub("[\"\047]", "", w)
+				if (w == "") continue
+				if (skip) { skip = 0; continue }
+				if (w ~ /^[0-9]*[<>]/) { if (w ~ /^[0-9]*[<>]+$/) skip = 1; continue }
+				if (first == "") {
+					if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w == "exec" || w == "nohup" || w == "env" || w == "command" || w == "!" || w == "if" || w == "then" || w == "else" || w == "while" || w == "do") continue
+					first = w
+					if (w == "." || w == "source") { src = 1; continue }
+					if (w ~ /[$`]/) { print "W\t" id "\tU\t" w; break }
+					print "W\t" id "\tP\t" w
+					b = w; sub(/.*\//, "", b)
+					if (b ~ /^(sh|ash|bash|dash|lua|ucode|perl|python[0-9.]*)$/) { interp = 1; continue }
+					break
+				}
+				if (src) { print "W\t" id "\t" ((w ~ /[$`]/) ? "U" : "S") "\t" w; break }
+				if (interp) { if (w ~ /^-/) continue; if (w ~ /\//) print "W\t" id "\t" ((w ~ /[$`]/) ? "U" : "P") "\t" w; break }
+			}
+		}
+	}
+	BEGIN {
+		while ((getline l < ENVIRON["FX_E"]) > 0) if (l !~ /^[ \t]*(#|$)/) etc[norm(l)] = 1
+		while ((getline l < ENVIRON["FX_I"]) > 0) {
+			split(l, f, "\t"); n = f[1]; p = substr(l, length(n) + 2)
+			raw = ENVIRON["FX_W"] "/raw." n; red = ENVIRON["FX_W"] "/red." n; ln = 0
+			while ((getline r < raw) > 0) {
+				ln++
+				if ((getline d < red) <= 0) d = "(line not shown)"
+				if (r ~ /^[ \t]*(#|$)/) continue
+				# NAME=value lines set the environment of the jobs
+				if (r ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=/) continue
+				if (norm(r) in etc) continue
+				if (length(d) > 300) d = substr(d, 1, 300) "..."
+				id = n ":" ln
+				print "L\t" id "\t" p " line " ln ": " d
+				c = r; sub(/^[ \t]+/, "", c)
+				if (c ~ /^@/) sub(/^[^ \t]+[ \t]+/, "", c)
+				else for (j = 1; j <= 5; j++) sub(/^[^ \t]+[ \t]*/, "", c)
+				words(c, id)
+			}
+			close(raw); close(red)
+		}
+	}' >"$_cw/p1"
+	awk -F'\t' '$1 == "W" && ($3 == "P" || $3 == "S") && !s[$4]++ { print $4 }' "$_cw/p1" |
+		while IFS= read -r _w; do au_cron_word "$_w"; done >"$_cw/cls0"
+	awk -F'\t' '$3 == "cand" { print $5 }' "$_cw/cls0" | sort -u | tr '\n' '\0' | fx_ls | fx_cmp "" 1 | fx_pkg >"$_cw/cmp"
+	FX_C="$_cw/cmp" awk -F'\t' '
+		FILENAME == ENVIRON["FX_C"] { st[$9] = $1; pk[$9] = ($11 == "-") ? "" : "; package " $11 " (" $12 ")"; next }
+		$3 != "cand" { print; next }
+		{
+			s = ($5 in st) ? st[$5] : "gone"
+			if (s == "same" || s == "meta") c = "image\tunchanged file of the firmware image"
+			else if (s == "new") c = "added\tnot in the firmware image" pk[$5]
+			else if (s == "noimage") c = "noimage\tnot compared (no usable firmware image)"
+			else if (s == "changed") c = "changed\tdiffers from the firmware image" pk[$5]
+			else c = "changed\tcould not be compared with the firmware image"
+			print "C\t" $2 "\t" c "\t" $5
+		}' "$_cw/cmp" "$_cw/cls0" >"$_cw/cls"
+	# functions defined by the files the lines source
+	awk -F'\t' '$1 == "W" && $3 == "S" && !s[$4]++ { print $4 }' "$_cw/p1" |
+		while IFS= read -r _w; do
+			_p=$(awk -F'\t' -v w="$_w" '$2 == w && $5 != "-" { print $5; exit }' "$_cw/cls")
+			[ -n "$_p" ] || continue
+			fx_refuse "$_p" >/dev/null && continue
+			rd "$_p" | awk -v w="$_w" '
+				match($0, /^[ \t]*(function[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/) {
+					f = substr($0, RSTART, RLENGTH); sub(/^[ \t]*(function[ \t]+)?/, "", f); sub(/[ \t]*\(\)$/, "", f)
+					print "F\t" w "\t" f
+				}'
+		done >"$_cw/funcs"
+	# per line: 2 (medium) RAM disk, missing program, download or pipe into a shell;
+	# 1 (low) a program the image does not have or has otherwise; 0 firmware
+	FX_C="$_cw/cls" FX_F="$_cw/funcs" awk -F'\t' '
+	function lvl(c) { return (c == "ram" || c == "notfound") ? 2 : ((c == "image" || c == "builtin") ? 0 : 1) }
+	function flush(   i, k, w, c, d, best, note) {
+		if (cur == "") return
+		best = 0; note = ""
+		for (i = 1; i <= nw; i++) {
+			w = ww[i]
+			if (kd[i] == "U") { c = "unresolved"; d = "a shell expansion, not resolved" } else { c = cls[w]; d = det[w] }
+			if (kd[i] == "P" && c == "notfound") {
+				for (k = 1; k <= nw; k++) if (kd[k] == "S" && ((ww[k], w) in fn)) { c = cls[ww[k]]; d = "a function of " ww[k] ", " det[ww[k]]; break }
+			}
+			if (lvl(c) > best) best = lvl(c)
+			if (lvl(c) > 0) { if (note != "") note = note "; "; note = note w ": " d }
+		}
+		if (line ~ /(wget|curl|uclient-fetch|tftp|base64)/ || line ~ /\|[ \t]*(sh|ash|bash)([ \t;&]|$)/) {
+			best = 2; if (note != "") note = note "; "; note = note "downloads or pipes into a shell"
+		}
+		if (note != "") note = "  <- " note
+		print best "\t" line note
+		cur = ""; nw = 0
+	}
+	FILENAME == ENVIRON["FX_C"] { cls[$2] = $3; det[$2] = $4; next }
+	FILENAME == ENVIRON["FX_F"] { fn[$2, $3] = 1; next }
+	$1 == "L" { flush(); cur = $2; line = substr($0, length($1 $2) + 3); next }
+	$1 == "W" { ww[++nw] = $4; kd[nw] = $3; next }
+	END { flush() }' "$_cw/cls" "$_cw/funcs" "$_cw/p1" >"$_cw/eval"
+	_sev=low
+	grep -q '^2' "$_cw/eval" && _sev=medium
+	awk -F'\t' '$1 > 0 { print $2 }' "$_cw/eval" |
+		au_add "$_sev" persistence.live_crontab "medium: the crontab is one the running crond reads (its -c directory); each program was compared with the firmware image, which says where it comes from, not what the line does" \
+			"Jobs in a crontab outside /etc/crontabs run programs the firmware does not ship" \
+			"crond runs these lines although they are not in /etc/crontabs: they come from the directory its -c option names. On GL.iNet that is /tmp/gl_crontabs, which the firmware rebuilds at every boot from its own jobs; a line whose program is not part of the image, lives on the RAM disk or does not exist was put there by something else. Lines marked medium run from the RAM disk, name a missing program, download or pipe into a shell." \
+			"Find what writes each line (persistence locations=[\"cron\"] names the scripts that mention the directory) and read the program (read_file, file_hash). Remove both if they are not yours; a line in a RAM-disk crontab comes back at the next boot until its generator is gone."
+	awk -F'\t' '$1 == 0 { print $2 }' "$_cw/eval" |
+		au_add info persistence.live_crontab_firmware "medium: every program these lines run is an unchanged file of the firmware image or a shell builtin; the arguments were not judged" \
+			"Firmware jobs in a crontab outside /etc/crontabs" \
+			"The running crond reads a crontab directory other than /etc/crontabs (GL.iNet: /tmp/gl_crontabs, rebuilt at boot). These lines run only programs of the firmware image; listed so that every line crond runs is accounted for." \
+			"Nothing."
 }
 
 # ---------------------------------------------------------------- update state
@@ -807,7 +1087,7 @@ au_wifi() {
 
 # ---------------------------------------------------------------- audit
 mcp_register audit <<'EOF'
-{"name":"audit","title":"Security audit","description":"Runs all security checks in one call and returns findings ordered by severity (high, medium, low, info), each with a stable check id, a confidence statement, the evidence it rests on (file, line, pid or socket), why it matters and what to do. It covers exposure to the WAN side, authentication (root password, uid 0 accounts, SSH keys and password logins), integrity against the firmware image (replaced programs, executables in /tmp, processes running deleted or foreign binaries, kernel modules, ld.so.preload), autostart entries the image does not have, update state and Wi-Fi encryption. The output ends with the checks that found nothing and the checks that could not run on this device and why. Start here, then follow up a finding with the specific tools.","inputSchema":{"type":"object","properties":{"categories":{"type":"array","items":{"type":"string","enum":["exposure","auth","integrity","persistence","updates","wifi"]},"description":"Only these categories. Default: all six."},"min_severity":{"type":"string","enum":["info","low","medium","high"],"description":"Leave out findings below this severity. Default info (everything).","default":"info"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"audit","title":"Security audit","description":"Runs all security checks in one call and returns findings ordered by severity (high, medium, low, info), each with a stable check id, a confidence statement, the evidence it rests on (file, line, pid or socket), why it matters and what to do. It covers exposure to the WAN side, authentication (root password, uid 0 accounts, SSH keys and password logins), integrity against the firmware image (replaced programs, executables in /tmp, processes running deleted or foreign binaries, kernel modules, ld.so.preload), autostart entries the image does not have (also in the crontab directory the running crond reads), update state, Wi-Fi encryption, and on GL.iNet firmware web API methods open without login, extra web admin accounts, the cloud remote terminal and the cloud binding. The output ends with the checks that found nothing and the checks that could not run on this device and why. Start here, then follow up a finding with the specific tools.","inputSchema":{"type":"object","properties":{"categories":{"type":"array","items":{"type":"string","enum":["exposure","auth","integrity","persistence","updates","wifi"]},"description":"Only these categories. Default: all six."},"min_severity":{"type":"string","enum":["info","low","medium","high"],"description":"Leave out findings below this severity. Default info (everything).","default":"info"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_audit() {
 	arg minsev min_severity info
