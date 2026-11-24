@@ -125,9 +125,10 @@ class Container:
 class Session:
     """One running server process. Lines in, lines out."""
 
-    def __init__(self, cmd: list[str]):
+    def __init__(self, cmd: list[str], env: dict[str, str] | None = None):
+        """env: environment of the local process (default: inherited)."""
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE)
+                                     stderr=subprocess.PIPE, env=env)
         self.lines: queue.Queue[bytes | None] = queue.Queue()
         self.stderr = bytearray()
         threading.Thread(target=self._pump, daemon=True).start()

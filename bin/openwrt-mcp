@@ -3,34 +3,60 @@
 #
 #   openwrt-mcp [options] [user@]HOST
 #
-#   -p PORT          SSH port
-#   -i KEY           SSH identity file
-#   -o OPTION        extra ssh -o option (repeatable)
-#   --no-redact      do not mask secrets (Wi-Fi keys, password hashes, private keys)
-#   --max-output N   bytes per tool result (default 60000)
-#   --build FILE     write the joined server script to FILE and exit
-#   -h, --help       this help
+#   -p PORT              SSH port
+#   -i KEY               SSH identity file
+#   -o OPTION            extra ssh -o option (repeatable; wins over the defaults)
+#   --no-redact          do not mask secrets (Wi-Fi keys, password hashes, private keys)
+#   --max-output N       bytes per tool result (default 60000)
+#   --call-timeout N     seconds per tool call (default 120)
+#   --build FILE         write the joined server script to FILE and exit
+#   --print-config NAME  print the "claude mcp add" line and an .mcp.json entry for
+#                        the other options given, and exit
+#   -h, --help           this help
 #
-# Copies the server to /tmp on the router (RAM) and speaks MCP over SSH's stdio.
-# Register it with Claude Code:  claude mcp add router -- /path/to/openwrt-mcp root@192.168.1.1
+# One SSH login per start (a ControlMaster with a private socket) copies the server
+# to /tmp on the router (RAM), checks its sha256 there and runs it; the server
+# deletes the file at once. MCP goes over the SSH session's stdin and stdout. The
+# login must work without a prompt (key authentication, known host key): the MCP
+# client has no terminal. Register it with Claude Code:
+#   claude mcp add router -- /path/to/openwrt-mcp root@192.168.1.1
 set -euo pipefail
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-srcdir=$here/../server
-ssh_opts=() env=(MCP_SELF_DELETE=1) build=
+# this file's real path, through symlinks (no readlink -f on older macOS)
+self=${BASH_SOURCE[0]}
+while [[ -L $self ]]; do
+	link=$(readlink "$self")
+	[[ $link == /* ]] && self=$link || self=$(dirname "$self")/$link
+done
+self=$(cd "$(dirname "$self")" && pwd -P)/$(basename "$self")
+srcdir=$(dirname "$self")/../server
+ssh_opts=() env=(MCP_SELF_DELETE=1) build='' config_name='' passthru=()
 
-usage() { sed -n '2,15s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '3,22s/^# \{0,1\}//p' "$self"; }
+die() { printf 'openwrt-mcp: %s\n' "$1" >&2; exit "${2:-1}"; }
+need() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value" 2; }
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
-	-p) ssh_opts+=(-p "$2"); shift ;;
-	-i) ssh_opts+=(-i "$2"); shift ;;
-	-o) ssh_opts+=(-o "$2"); shift ;;
-	--no-redact) env+=(MCP_REDACT=0) ;;
-	--max-output) [[ $2 =~ ^[0-9]+$ ]] || { echo "--max-output needs a number" >&2; exit 2; }; env+=("MCP_MAX_OUTPUT=$2"); shift ;;
-	--build) build=$2; shift ;;
+	-p) need "$@"; ssh_opts+=(-p "$2"); passthru+=(-p "$2"); shift ;;
+	-i)
+		need "$@"
+		key=$2
+		# the MCP client starts us from anywhere: make a relative key path absolute
+		[[ $key == /* || ! -e $key ]] || key=$(cd "$(dirname "$key")" && pwd -P)/$(basename "$key")
+		ssh_opts+=(-i "$key"); passthru+=(-i "$key"); shift ;;
+	-o) need "$@"; ssh_opts+=(-o "$2"); passthru+=(-o "$2"); shift ;;
+	--no-redact) env+=(MCP_REDACT=0); passthru+=(--no-redact) ;;
+	--max-output | --call-timeout)
+		need "$@"
+		[[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 needs a positive number" 2
+		if [[ $1 == --max-output ]]; then env+=("MCP_MAX_OUTPUT=$2"); else env+=("MCP_CALL_TIMEOUT=$2"); fi
+		passthru+=("$1" "$2"); shift ;;
+	--build) need "$@"; build=$2; shift ;;
+	--print-config) need "$@"; config_name=$2; shift ;;
 	-h | --help) usage; exit 0 ;;
-	-*) echo "unknown option: $1" >&2; exit 2 ;;
+	--) shift; break ;;
+	-*) die "unknown option: $1 (see --help)" 2 ;;
 	*) break ;;
 	esac
 	shift
@@ -39,9 +65,101 @@ done
 joined() { cat "$srcdir"/[0-9][0-9]-*.sh; }
 
 if [[ -n $build ]]; then joined >"$build"; exit 0; fi
-[[ $# -eq 1 ]] || { usage >&2; exit 2; }
+if [[ $# -ne 1 ]]; then usage >&2; exit 2; fi
 target=$1
 
-remote=/tmp/openwrt-mcp-$$.sh
-joined | ssh -T "${ssh_opts[@]+"${ssh_opts[@]}"}" -o BatchMode=yes "$target" "cat > $remote"
-exec ssh -T "${ssh_opts[@]+"${ssh_opts[@]}"}" -o BatchMode=yes "$target" "${env[*]} exec sh $remote"
+# ---------------------------------------------------------------- --print-config
+json() { # one JSON string literal
+	local s=$1
+	s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}
+	printf '"%s"' "$s"
+}
+if [[ -n $config_name ]]; then
+	args=("${passthru[@]+"${passthru[@]}"}" "$target")
+	printf '# Claude Code (add --scope user to have it in every project):\n'
+	printf 'claude mcp add %q --' "$config_name"
+	printf ' %q' "$self" "${args[@]}"
+	printf '\n\n# or in .mcp.json:\n'
+	printf '{\n  "mcpServers": {\n    %s: {\n      "command": %s,\n      "args": [' "$(json "$config_name")" "$(json "$self")"
+	sep=''
+	for a in "${args[@]}"; do printf '%s%s' "$sep" "$(json "$a")"; sep=', '; done
+	printf ']\n    }\n  }\n}\n'
+	exit 0
+fi
+
+# ---------------------------------------------------------------- start
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+	elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+	else openssl dgst -sha256 -r | cut -d' ' -f1
+	fi
+}
+
+# private directory for the control socket and the ssh log; socket paths are limited
+# to about 100 bytes, so fall back to /tmp when TMPDIR is long
+base=${TMPDIR:-/tmp}
+[[ ${#base} -le 60 && -d $base ]] || base=/tmp
+dir=$(mktemp -d "${base%/}/openwrt-mcp.XXXXXX") || die "cannot create a temp dir in $base"
+sock=$dir/ctl
+log=$dir/ssh.log
+script=$dir/server.sh
+child=''
+
+# shellcheck disable=SC2329  # run by the EXIT trap
+cleanup() {
+	set +e
+	trap '' HUP INT TERM
+	if [[ -n $child ]]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
+	[[ -S $sock ]] && ssh -o ControlPath="$sock" -O exit "$target" >/dev/null 2>&1
+	rm -rf "$dir"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
+
+ssh_base=(ssh -T "${ssh_opts[@]+"${ssh_opts[@]}"}" -o BatchMode=yes -o ConnectTimeout=15
+	-o ServerAliveInterval=30 -o LogLevel=ERROR -o ControlPath="$sock")
+
+explain() { # RC: why ssh failed, from its log
+	local hint
+	sed 's/^/  /' "$log" >&2
+	if grep -qiE 'host key verification failed|no .*host key is known|remote host identification has changed' "$log"; then
+		hint="the router's SSH host key is not known (or has changed). Log in once by hand so ssh can record it, then start again: ssh ${ssh_opts[*]-} $target"
+	elif grep -qiE 'permission denied|too many authentication failures|no more authentication methods' "$log"; then
+		hint="key authentication to $target failed. The MCP client has no terminal for a password prompt: add your public key on the router (LuCI: System > Administration > SSH-Keys, or /etc/dropbear/authorized_keys), pass it with -i if needed, and check that 'ssh ${ssh_opts[*]-} $target' logs in without asking"
+	elif grep -qiE 'connection refused|timed out|no route|could not resolve|network is unreachable' "$log"; then
+		hint="cannot reach SSH on $target; check the address, the port (-p) and that SSH is enabled on the router"
+	else
+		hint="ssh to $target failed (exit $1)"
+	fi
+	printf 'openwrt-mcp: %s\n' "$hint" >&2
+}
+
+joined >"$script"
+hash=$(sha256 <"$script")
+[[ $hash =~ ^[0-9a-f]{64}$ ]] || die "cannot compute the sha256 of the server script"
+remote=/tmp/openwrt-mcp.$(date +%s).$$.$RANDOM$RANDOM.sh
+
+# 1. log in once (the master stays in the background) and copy the server; set -C:
+#    an existing file, or a planted symlink, is never written through
+set +e
+"${ssh_base[@]}" -o ControlMaster=yes -o ControlPersist=60 "$target" \
+	"umask 077; set -C; cat > $remote" <"$script" >/dev/null 2>"$log"
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then explain "$rc"; exit 1; fi
+
+# 2. over the same connection: check the copy's sha256 on the router, then run it
+run="h=\$(sha256sum $remote 2>/dev/null); set -- \$h
+if [ \"\$1\" = $hash ]; then export ${env[*]}; exec sh $remote; fi
+rm -f $remote; echo \"openwrt-mcp: the server script on the router does not match its sha256 (got \$1); not started\" >&2; exit 1"
+exec 3<&0
+"${ssh_base[@]}" -o ControlMaster=no "$target" "$run" <&3 3<&- &
+child=$!
+set +e
+wait "$child"
+rc=$?
+set -e
+child=''
+exit "$rc"
