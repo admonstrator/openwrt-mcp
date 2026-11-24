@@ -39,7 +39,8 @@ Then ask Claude something like *"Audit the router and tell me what to look at fi
 
 Launcher options: `-p PORT`, `-i KEY`, `-o SSH_OPTION`, `--no-redact`,
 `--max-output BYTES` (default 60000), `--call-timeout SECONDS` (default 120),
-`--build FILE` (write the single-file server, for example to run it by hand).
+`--admin` (write tools, see below), `--build FILE` (write the single-file server, for
+example to run it by hand).
 
 ## Tools
 
@@ -64,14 +65,38 @@ Launcher options: `-p PORT`, `-i KEY`, `-o SSH_OPTION`, `--no-redact`,
 | `persistence` | Every place code can start from by itself, with what differs from the image |
 | `users_auth` | Accounts, SSH keys with fingerprints, SSH and web login settings |
 | `audit` | Findings with severity, evidence, confidence and what to do |
+| `glinet` | GL.iNet firmware: GoodCloud and remote terminal, admin access, VPN servers, sharing, updates |
 | `exec` | Any shell command as root (asks every time) |
 
 [docs/tools.md](docs/tools.md) describes every tool, its arguments and the audit's checks.
 
+## Admin mode: configuring the router
+
+With `--admin` the server also offers tools that change the router. Register it as a
+second server next to the read-only one, so each keeps its own permissions:
+
+```sh
+~/openwrt-mcp/bin/openwrt-mcp --admin --print-config router-admin root@192.168.1.1
+```
+
+| Tool | What it does |
+| --- | --- |
+| `glinet_api` | Lists and calls the GL.iNet web API on the router (`ubus call gl-session call`), with a method catalog from [glinet-api](https://github.com/admonstrator/glinet-api) |
+| `uci_change` | uci operations on one package, with dry run, commit and reload |
+| `service_control` | Status, start, stop, restart, reload, enable, disable of an init script |
+
+Every write call reports what changed in `/etc/config`. Calls that can cut off your
+access, expose the router or reset, flash or reboot it run only with `confirm: true`,
+which Claude is told to set only after you agreed to that exact call. There is no
+automatic rollback: a change that cuts the SSH connection stays. Without `--admin` the
+write modules are not even part of the script. Do not use admin mode on a router you
+suspect to be compromised.
+
 ## Safety
 
-- **Read-only.** Except `exec`, no tool changes the router: no writes outside its own
-  temp directory, no `uci commit`, no service restarts, no network traffic.
+- **Read-only by default.** Except `exec`, no tool of the default server changes the
+  router: no writes outside its own temp directory, no `uci commit`, no service
+  restarts, no network traffic. Only `--admin` adds write tools.
 - **Trusted tools.** If the firmware image (`/rom`) has a busybox, every tool call runs
   with it first in `PATH`, so a replaced applet in the overlay cannot lie. Sockets are
   read from `/proc`, never with `netstat` (on GL.iNet devices infected with the

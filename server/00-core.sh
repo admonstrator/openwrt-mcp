@@ -63,7 +63,8 @@
 #   MCP_CALL_TIMEOUT   seconds per tool call      default 120
 #   MCP_SELF_DELETE    1 removes this script file after start (launcher sets it)
 #   MCP_DEBUG          1 logs requests to stderr
-#   MCP_PROC           proc root for the audit's process checks (tests)  default /proc
+#   MCP_PROC           proc root for process lookups of audit, persistence
+#                      and glinet (tests)                               default /proc
 #   MCP_ADMIN          1 registers the write tools (admin mode)           default 0
 #
 # ---------------------------------------------------------------- how a call runs
@@ -455,7 +456,7 @@ in_rom() { [ -e "$(rom_path "$1")" ] || [ -L "$(rom_path "$1")" ]; }
 # in key (key, key1, apikey, private_key); public_key, pubkey, keyid, key_mgmt and
 # *PasswordAuth stay readable. Formats: uci show (pkg.section.option=value), config
 # files (option/list name value), shadow lines (any hash, also behind ! or *, DES),
-# PEM private key blocks, WireGuard PrivateKey/PresharedKey =, hostapd r0kh=/r1kh=
+# PEM private key blocks (also a whole block on one line), WireGuard PrivateKey/PresharedKey =, hostapd r0kh=/r1kh=
 # (last field) and per-station PSK files (... MAC PSK), name=value lines (hostapd,
 # wpa_supplicant, shell, env; not when the value is a shell expansion), pretty-printed
 # JSON members, and command lines: --name=value / --name value for secret names, and
@@ -490,6 +491,12 @@ redact() {
 			out = out pre t
 		}
 		return out s
+	}
+	# a whole key on one line (JSON answers keep newlines as \n): mask it in place
+	/-----BEGIN [A-Z ]*PRIVATE KEY-----.*-----END [A-Z ]*PRIVATE KEY-----/ {
+		line = $0
+		gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*-----END [A-Z ]*PRIVATE KEY-----/, "<redacted private key>", line)
+		print line; next
 	}
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { print; inkey = 1; next }
 	inkey && /-----END [A-Z ]*PRIVATE KEY-----/ { print "<redacted>"; print; inkey = 0; next }

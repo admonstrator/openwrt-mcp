@@ -14,13 +14,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: shellcheck (server modules as POSIX sh, launcher as bash)
+      - name: shellcheck (server modules as POSIX sh, launcher as bash, scripts)
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -s sh server/*.sh
-          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable bin/openwrt-mcp
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable bin/openwrt-mcp scripts/*.sh
       - name: sh -n on the joined server (dash and the oldest busybox ash)
         run: |
-          bin/openwrt-mcp --build "$RUNNER_TEMP/openwrt-mcp.sh"
+          bin/openwrt-mcp --admin --build "$RUNNER_TEMP/openwrt-mcp.sh"
           sh -n "$RUNNER_TEMP/openwrt-mcp.sh"
           docker run --rm -v "$RUNNER_TEMP/openwrt-mcp.sh:/s.sh:ro" openwrt/rootfs:x86-64-21.02.7 sh -n /s.sh
 

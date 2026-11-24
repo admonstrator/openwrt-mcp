@@ -114,6 +114,18 @@ class TestHelpers(OpenWrtTestCase):
         self.assertIn("$1>", out)
 
     @needs_container
+    def test_redact_one_line_key(self):
+        # a whole PEM block inside one JSON line must not swallow the lines after it
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            printf '%s\n' '"cert": "-----BEGIN PRIVATE KEY-----\\nMIIsecret\\n-----END PRIVATE KEY-----\\n", "x": 1' \
+              '"after": "visible"' | redact""")
+        self.assertNotIn("MIIsecret", out)
+        self.assertIn("<redacted private key>", out)
+        self.assertIn('"x": 1', out)
+        self.assertIn('"after": "visible"', out)
+
+    @needs_container
     def test_lib_sockets(self):
         # a listener we know: busybox nc may be missing, so use the server itself? no:
         # just check format on whatever /proc/net has

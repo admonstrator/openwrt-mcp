@@ -106,7 +106,7 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
     JSON members (ubus);
   - shadow lines with any hash, also behind `!`/`*` (locked) and 13-character DES
     hashes (`name:<redacted hash, $6>:...`); a bare `!` or `*` is kept;
-  - PEM private key blocks, WireGuard `PrivateKey =`/`PresharedKey =`, hostapd
+  - PEM private key blocks (also a whole block on one line, as in JSON text), WireGuard `PrivateKey =`/`PresharedKey =`, hostapd
     `r0kh=`/`r1kh=` (the last field, the key) and per-station PSK files
     (`[keyid=..] [vlanid=..] MAC PSK`);
   - command lines: `--name=value` and `--name value` for the secret names above, and on
@@ -581,8 +581,9 @@ installed`. Sections, most important first, so that the output cap cuts only the
 
 ## 5 Admin mode: write tools
 
-(server/60-admin-glinet.sh, server/65-admin-uci.sh; core support in server/00-core.sh,
-server/05-lib.sh, bin/openwrt-mcp)
+(server/60-admin-glinet.sh with its generated catalog server/61-admin-glinet-catalog.sh
+from scripts/glinet-methods.sh, server/65-admin-uci.sh; core support in
+server/00-core.sh, server/05-lib.sh, bin/openwrt-mcp)
 
 Only with launcher `--admin` (`MCP_ADMIN=1`): the script then includes the modules
 `server/NN-admin-*.sh`, and their tools are registered with `mcp_register_admin`.
