@@ -395,6 +395,16 @@ fx_secret_name() {
 	return 1
 }
 
+# GL.iNet's device private key (/proc/gl-hw-info/device_key, decision 2.7), by the name
+# given and by the path it resolves to: it need not be PEM, so redact cannot be trusted
+# to mask it in any view.
+fx_device_key() {
+	for _fdk in "$1" "$(readlink -f "$1" 2>/dev/null)"; do
+		case $_fdk in */gl-hw-info/device_key) return 0 ;; esac
+	done
+	return 1
+}
+
 # Second redaction pass for the file tools: "name=value", "name: value" and JSON pairs
 # whose name is a secret (hostapd and wpa_supplicant configs, env files, ppp secrets).
 # The core's redact covers uci, shadow and PEM blocks; this covers what it does not.
@@ -465,7 +475,7 @@ fx_show() {
 
 # ---------------------------------------------------------------- read_file
 mcp_register read_file <<'EOF'
-{"name":"read_file","title":"Read a file","description":"Reads one file on the router with paging: text with line numbers, a binary file as hex dump (view=hex) or as its printable strings (view=strings). The header gives type, mode, owner, size, mtime and whether the file equals the same path in the firmware image. While redaction is on, text passes through the secret filter (Wi-Fi keys, password hashes and private keys are masked) and the raw views of key files are refused. FIFOs, sockets, device nodes and links into /proc, /sys or /dev are never opened.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the file."},"view":{"type":"string","enum":["auto","text","hex","strings"],"description":"auto (default): text for text files; for binary files the first 256 bytes as hex. text: lines. hex: hexdump -C. strings: printable strings of at least min_length characters.","default":"auto"},"offset":{"type":"integer","description":"Where to start: lines to skip for text and strings, bytes to skip for hex. Default 0.","default":0,"minimum":0},"limit":{"type":"integer","description":"How much to return: lines for text and strings (default 200, at most 2000), bytes for hex (default 512, at most 8192).","minimum":1},"min_length":{"type":"integer","description":"Shortest string for view=strings. Default 6.","default":6,"minimum":2,"maximum":64},"line_numbers":{"type":"boolean","description":"Prefix text lines with their line number. Default true.","default":true}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"read_file","title":"Read a file","description":"Reads one file on the router with paging: text with line numbers, a binary file as hex dump (view=hex) or as its printable strings (view=strings). The header gives type, mode, owner, size, mtime and whether the file equals the same path in the firmware image. While redaction is on, text passes through the secret filter (Wi-Fi keys, password hashes and private keys are masked) and the raw views of key files are refused (GL.iNet's device key in every view). FIFOs, sockets, device nodes and links into /proc, /sys or /dev are never opened.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the file."},"view":{"type":"string","enum":["auto","text","hex","strings"],"description":"auto (default): text for text files; for binary files the first 256 bytes as hex. text: lines. hex: hexdump -C. strings: printable strings of at least min_length characters.","default":"auto"},"offset":{"type":"integer","description":"Where to start: lines to skip for text and strings, bytes to skip for hex. Default 0.","default":0,"minimum":0},"limit":{"type":"integer","description":"How much to return: lines for text and strings (default 200, at most 2000), bytes for hex (default 512, at most 8192).","minimum":1},"min_length":{"type":"integer","description":"Shortest string for view=strings. Default 6.","default":6,"minimum":2,"maximum":64},"line_numbers":{"type":"boolean","description":"Prefix text lines with their line number. Default true.","default":true}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_read_file() {
 	fx_names_env
@@ -476,6 +486,10 @@ tool_read_file() {
 	arg_int minlen min_length 6 2 64 || return 1
 	if why=$(fx_refuse "$p"); then
 		tool_error "$p: $why"
+		return 1
+	fi
+	if [ "$MCP_REDACT" = 1 ] && fx_device_key "$p"; then
+		tool_error "$p: the GL.iNet device private key; no view of it is shown while redaction is on, because it need not be PEM text that the secret filter recognises (file_hash still works)"
 		return 1
 	fi
 	src=$p

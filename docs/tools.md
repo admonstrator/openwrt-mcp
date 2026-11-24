@@ -294,9 +294,9 @@ style arguments itself.
 
 ## 4 Files, forensics and audit
 
-(server/30-files.sh, server/40-forensics.sh, server/50-audit.sh)
+(server/30-files.sh, server/40-forensics.sh, server/45-glinet.sh, server/50-audit.sh)
 
-All eight tools are read-only. They compare with the firmware image at `MCP_ROM` by
+All nine tools are read-only. They compare with the firmware image at `MCP_ROM` by
 content (size first, SHA-256 when the sizes match), never by "is the path in the
 overlay", so a bind mount over an image file shows up too. The image counts as usable
 when it holds a system tree (`etc`, `bin`, `usr` or `lib`); without one every tool says
@@ -322,6 +322,10 @@ The header gives type, mode, owner, mtime, size and the image comparison.
   files that hold key material by name (`dropbear_*_host_key`, `*.key`, `*.pem`,
   `id_*`, `shadow`, ...) are refused. A private key block collapses to one line, so line
   numbers after it differ from the file.
+- GL.iNet's device private key, `/proc/gl-hw-info/device_key` (any path ending in
+  `/gl-hw-info/device_key`, by the name given and by what it resolves to), is refused in
+  every view while redaction is on, text included: it need not be PEM, so the secret
+  filter cannot be trusted with it. `file_hash` still hashes it.
 
 ### list_dir
 
@@ -404,6 +408,17 @@ the image. Arguments: `locations` (any of `cron`, `rc_local`, `init`, `inittab`,
 - Also read: uci firewall includes and the dnsmasq `dhcpscript` (their files join the
   list wherever they live), uci dhcp options that hook or redirect, whether cron is
   enabled.
+- cron also shows what actually runs: the crontab directory of every running `crond`
+  (its `-c DIR`, also `-cDIR` and in clusters such as `-fc DIR`; busybox' default
+  `/var/spool/cron/crontabs` without one, which OpenWrt links to `/etc/crontabs`).
+  Command lines come from `MCP_PROC` (default `/proc`). A directory that resolves to
+  `/etc/crontabs` is only named; a missing one is said; for any other (GL.iNet:
+  `crond -f -c /tmp/gl_crontabs -l 7`) every file in it and in its `crontabs.d`
+  subdirectory (not crond's `cron.update` marker) is listed with its active lines,
+  redacted, before the files of `/etc/crontabs` and `/etc/cron.d`. Files on the RAM disk
+  are marked `[RAM disk]`: something rebuilds them at every boot; the generator is not
+  known, but the init scripts and `rc.local` that name the directory are listed as
+  candidates. Without a running crond the section says that nothing runs.
 
 ### users_auth
 
@@ -432,6 +447,8 @@ lines (at most 25), why it matters and what to do.
 | `exposure.wan_open_port` | medium | listening socket plus the uci rule that accepts its port from the WAN zone |
 | `exposure.port_forward` | low | uci redirects from the WAN zone |
 | `exposure.firewall_not_loaded` | low | no `fw4` table (nft) or no `zone_*` chains (iptables-save) |
+| `exposure.gl_remote_terminal` | medium | GL.iNet: a running `rtty` process (command line redacted, its `-t` token masked), or GoodCloud enabled while rtty SSH or web access is on |
+| `exposure.gl_cloud_bound` | low | GL.iNet: GoodCloud enabled and bound to an account (username, email, bind time, server) |
 | `auth.root_no_password` | high | empty password field of root |
 | `auth.extra_uid0` | high | accounts with uid 0 besides root |
 | `auth.ssh_password_from_wan` | high | SSH instance with password login whose port the WAN side reaches |
@@ -439,6 +456,9 @@ lines (at most 25), why it matters and what to do.
 | `auth.empty_password` | medium | other login accounts with an empty password |
 | `auth.account_added` | low | login accounts that are not in the image |
 | `auth.authorized_keys` | low | every authorized key with its fingerprint |
+| `auth.gl_no_auth_methods` | high | GL.iNet: `object.method` pairs of the `no-auth-methods` sections of `/etc/config/oui-httpd` that the image's copy does not have (callable through the web API without login) |
+| `auth.gl_admin_accounts` | medium | GL.iNet: accounts besides root in table `account` of `/etc/oui/oui.db` (read from a copy with `sqlite3 -readonly`; "Could not check" without sqlite3 or the database) |
+| `auth.gl_console_login` | low | GL.iNet: `oui-httpd.main.console_disabled` off while the image has it on (login on the serial console) |
 | `integrity.image_file_replaced` | high | overlay holds another version of an image program, written after first boot, no package upgrade explains it |
 | `integrity.image_data_changed` | low | a data or configuration file of the image in a program directory differs, changed after first boot |
 | `integrity.first_boot_changes` | info | files in program directories that the firmware wrote at first boot |
@@ -465,6 +485,8 @@ lines (at most 25), why it matters and what to do.
 | `persistence.first_boot_changes` | info | startup scripts that the firmware wrote at first boot |
 | `persistence.user_autostart` | low; medium when a line downloads, pipes into a shell or uses the RAM disk | active lines of cron files (not crond's `cron.update`), `rc.local`, changed profile and firewall scripts |
 | `persistence.feeds_changed` | low | package feeds or keys that differ from the image |
+| `persistence.live_crontab` | medium when a line runs a program from the RAM disk, names one that does not exist, downloads or pipes into a shell; else low | active lines of the crontabs the running crond reads outside `/etc/crontabs` (GL.iNet: `/tmp/gl_crontabs`) whose programs are not unchanged image files (not in the image, changed, a shell expansion), each with the reason |
+| `persistence.live_crontab_firmware` | info | the other lines of those crontabs: every program they run is an unchanged image file or a shell builtin (GL.iNet's own jobs) |
 | `persistence.package_autostart` | info | autostart files of packages installed after flashing |
 | `updates.branch_eol` | medium (low on GL.iNet firmware) | `DISTRIB_RELEASE` on a branch in the built-in end-of-life list (17.01 to 23.05, as of 2026-11) |
 | `updates.firmware_age` | low | release file of the image older than 365 days |
@@ -500,11 +522,62 @@ assessed.
 
 Each thing is reported by one check: autostart locations belong to the persistence
 checks, so the integrity checks skip them, and a socket the zone policy already opens is
-not repeated for a rule.
+not repeated for a rule. A line of a live crontab that also stands in a file of
+`/etc/crontabs` is left to `persistence.user_autostart`. The live-crontab check judges a
+line by the programs it runs: the first word of every command (after `.` or `source`
+the file read, after `sh`, `lua` and other interpreters the script), bare names looked
+up in `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`; a name that a sourced file defines as a
+function counts as that file. Arguments are not judged.
+
+The GL.iNet checks need `/etc/glversion`; on other firmware they are listed under "Could
+not check". They read uci, files and `/proc` (decision 2.5), compare `oui-httpd` with the
+image's copy, and leave out the server's own processes.
 
 `MCP_PROC` (default `/proc`) is where the process checks read exe links, environments
-and the module list. It exists for the tests, because in an emulated container every
+and the module list, and where `persistence`, `glinet` and the GL.iNet and live-crontab
+checks find crond, rtty and gl-cloud by their `comm` and read `gl-hw-info`. It exists for the tests, because in an emulated container every
 `/proc/PID/exe` points at the emulator; sockets always come from the real `/proc`.
+
+### glinet
+
+No arguments. On GL.iNet firmware (4.x, recognised by `/etc/glversion`) it shows what the
+vendor firmware has switched on that reaches the router from outside, reports to outside
+or controls access to it. Elsewhere it prints one line: not GL.iNet firmware, no
+`/etc/glversion`.
+
+Everything comes from uci (`lib_uci_dump`), files and `/proc`; the GL web API is never
+called (decision 2.5: some get methods have side effects). `/proc/gl-hw-info` is read
+below `MCP_PROC`; its `device_key`, `device_cert` and `device_sn` are never read. Options
+are printed as `uci show` lines through `redact`; tokens (`gl-cloud` token) are only
+reported as present. A package that is missing gives one line `<thing> (<package>): not
+installed`. Sections, most important first, so that the output cap cuts only the tail:
+
+1. Remote management: GoodCloud (`gl-cloud`: enable, server, binding with username,
+   email, bindtime, bindtype, token present or not) and whether a `gl-cloud` process
+   runs; the remote terminal `rtty` (`general.ssh_en`, `web_en`, the process with its
+   command line, `-t` token masked) and a warning when GoodCloud and rtty access are both
+   on; AstroWarp (`mptun.global`); GL DDNS (`gl_ddns`) and the device DDNS name from
+   `gl-hw-info/device_ddns`.
+2. Admin access: the options of `oui-httpd.main`, each with the image's value where it
+   differs (from `$MCP_ROM/etc/config/oui-httpd`), `console_disabled` explained; the
+   methods callable without login (`no-auth-methods` sections), each marked `[image]`,
+   `[ADDED]` or `[-]` (no image), ADDED first, at most 60 per object and 40 lines;
+   the `listen` lines of `/etc/nginx/conf.d/gl.conf`; web admin accounts from table
+   `account` of `/etc/oui/oui.db` (copied below `MCP_TMP`, opened with `sqlite3
+   -readonly`; "sqlite3: not available" otherwise); the `wan-access` whitelist; the
+   firewall rules and redirects GL writes for WAN access to the router and DMZ
+   (`ping_wan`, `https_wan`, `ssh_wan` and IPv6 twins, `GL-*`, DMZ) with src, port,
+   target and enabled, at most 40.
+3. VPN servers and mesh VPNs: WireGuard server (`wireguard_server.main_server`, peer
+   count and names, interface `wgserver`), OpenVPN server (`ovpnserver`, and the number of
+   lines in `/etc/openvpn/cert/user_passwd.txt`, never its content), Tailscale, ZeroTier,
+   Tor, site-to-site WireGuard (`gl_s2s`).
+4. Sharing: NAS (`nas`, WebDAV and service ports), Samba shares (name, path, guest ok,
+   read only; at most 30), GL's WAN rules for sharing (`sambasharewan`, `glnas_ser`,
+   `webdav_wan`), DLNA (`minidlna`).
+5. Firmware and updates: version and type (`/etc/glversion`, `/etc/version.type`), model,
+   country code, flash size, the `upgrade` settings (`gray_url` is the beta channel);
+   plugin feeds are left to `persistence locations=["feeds"]`.
 
 ## 5 Admin mode: write tools
 

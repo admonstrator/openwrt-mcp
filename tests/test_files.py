@@ -429,5 +429,34 @@ class TestReviewFindings(FilesFixture):
                 self.assertIn("redaction is on", text)
 
 
+class TestGLDeviceKey(FilesFixture):
+    """GL.iNet's /proc/gl-hw-info/device_key (decision 2.7). A fixture stands in for the
+    procfs file; it is not PEM, so the secret filter would not recognise it."""
+
+    KEY = b"devicekeyQ29udGVudA\n"
+
+    def setUp(self):
+        self.sh("mkdir -p /fxproc/gl-hw-info && printf 'devicekeyQ29udGVudA\\n' > /fxproc/gl-hw-info/device_key && "
+                "echo GL-BE14000 > /fxproc/gl-hw-info/model && ln -sfn /fxproc/gl-hw-info/device_key /fx/dk")
+
+    def test_every_view_is_refused(self):
+        for path in ("/fxproc/gl-hw-info/device_key", "/fx/dk", "/fxproc/gl-hw-info/./device_key"):
+            for view in ("auto", "text", "hex", "strings"):
+                text, err = self.tool("read_file", ROM, path=path, view=view)
+                self.assertTrue(err, f"{path} {view}: {text}")
+                self.assertIn("GL.iNet device private key", text)
+                self.assertIn("file_hash still works", text)
+                self.assertNotIn("devicekey", text)
+        # the other files there stay readable
+        self.assertIn("GL-BE14000", self.tool_ok("read_file", ROM, path="/fxproc/gl-hw-info/model"))
+
+    def test_hash_works_and_redaction_off_shows_it(self):
+        text = self.tool_ok("file_hash", ROM, paths=["/fxproc/gl-hw-info/device_key"])
+        self.assertIn(hashlib.sha256(self.KEY).hexdigest(), text)
+        self.assertNotIn("devicekey", text)
+        text = self.tool_ok("read_file", PLAIN, path="/fxproc/gl-hw-info/device_key")
+        self.assertIn("devicekeyQ29udGVudA", text)
+
+
 if __name__ == "__main__":
     unittest.main()

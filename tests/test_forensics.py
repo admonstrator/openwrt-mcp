@@ -464,5 +464,53 @@ printf "config general 'general'\n\toption password 'glsecret111'\n\toption clou
             self.assertNotIn("cloudtok222", text)
 
 
+class TestPersistenceLiveCrontabs(Fixture):
+    """cron: the directory the running crond reads (decision 2.6), from a fixture proc
+    root: GL.iNet's crond with -c /tmp/gl_crontabs, one with busybox' default directory
+    (a link to /etc/crontabs) and one whose directory is missing."""
+
+    ENV ={"MCP_ROM": ROM_DIR, "MCP_PROC": "/fixture/proc"}
+    SETUP = r"""
+set -e
+P=/fixture/proc
+mkdir -p $P/4000 $P/4001 $P/4002 /tmp/gl_crontabs/crontabs.d /var/spool/cron
+for p in 4000 4001 4002; do echo crond > $P/$p/comm; : > $P/$p/environ; done
+printf '/usr/sbin/crond|-f|-c|/tmp/gl_crontabs|-l|7|' | tr '|' '\000' > $P/4000/cmdline
+printf 'crond|-fS|' | tr '|' '\000' > $P/4001/cmdline
+printf 'crond|-l5|-c/srv/nocron|' | tr '|' '\000' > $P/4002/cmdline
+ln -sfn /etc/crontabs /var/spool/cron/crontabs
+printf '* * * * * /usr/bin/auto_timezone\n# a comment\n' > /tmp/gl_crontabs/root
+printf '0 3 * * * /tmp/.x/job --password=cronsecret44\n' > /tmp/gl_crontabs/crontabs.d/extra
+echo root > /tmp/gl_crontabs/cron.update
+printf '#!/bin/sh /etc/rc.common\nstart() { mkdir -p /tmp/gl_crontabs; }\n' > /etc/init.d/gl_cron
+"""
+
+    def test_the_directories_crond_reads(self):
+        text = self.tool_ok("persistence", self.ENV, locations=["cron"])
+        self.assertIn("running crond (pid 4000: /usr/sbin/crond -f -c /tmp/gl_crontabs -l 7) reads /tmp/gl_crontabs, "
+                      "outside /etc/crontabs; its files run as they are:", text)
+        self.assertIn("running crond (pid 4001: crond -fS) reads /var/spool/cron/crontabs -> /etc/crontabs, "
+                      "that is /etc/crontabs (listed below)", text)
+        self.assertIn("reads /srv/nocron, which does not exist: that crond runs nothing", text)
+        self.assertIn("  [RAM disk] /tmp/gl_crontabs/root  (f 0644", text)
+        self.assertIn("generator unknown, scripts that name /tmp/gl_crontabs: /etc/init.d/gl_cron)", text)
+        self.assertIn("      * * * * * /usr/bin/auto_timezone", text)
+        self.assertNotIn("a comment", text)
+        self.assertIn("[RAM disk] /tmp/gl_crontabs/crontabs.d/extra", text)
+        self.assertIn("0 3 * * * /tmp/.x/job --password=<redacted>", text)
+        self.assertNotIn("cronsecret44", text)
+        self.assertNotIn("cron.update", text)
+        # the live part comes first, the files of /etc/crontabs after it
+        self.assertLess(text.index("/tmp/gl_crontabs/root"), text.index("/etc/crontabs and /etc/cron.d:"))
+
+    def test_line_cap_and_no_crond(self):
+        text = self.tool_ok("persistence", self.ENV, locations=["cron"], max_lines=0)
+        self.assertIn("[RAM disk] /tmp/gl_crontabs/root", text)
+        self.assertNotIn("auto_timezone", text)
+        text = self.tool_ok("persistence", ROM, locations=["cron"])
+        self.assertIn("running crond: none found in /proc; no crontab runs while crond is stopped", text)
+        self.assertNotIn("/tmp/gl_crontabs", text)
+
+
 if __name__ == "__main__":
     unittest.main()
