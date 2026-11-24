@@ -130,7 +130,7 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
 | `MCP_DEBUG` | `0` | `1`: log requests to stderr |
 | `MCP_ADMIN` | `0` | `1`: admin mode, the write tools of section 5 are registered (launcher `--admin`); any other value is `0` |
 
-Invalid numbers fall back to the default. Set by the server for every process of a call:
+Invalid numbers fall back to the default. A module marks a tool with `mcp_own_timeout NAME` when its own integer `timeout` argument should raise the call limit to timeout + 5 s (`exec` and the write tools). Set by the server for every process of a call:
 `MCP_CALL_TAG` (internal, for the timeout).
 
 ### `exec`

@@ -12,7 +12,10 @@
 #   EOF                              and annotations. Tools are listed in registration
 #                                    order, so in file order.
 #
-#   mcp_register_admin NAME <<'EOF'  the same for a tool that changes the router: it is
+#   mcp_own_timeout NAME             the tool's own integer argument "timeout" (seconds)
+#                                    raises the call limit to timeout + 5 s
+#
+#   mcp_register_admin NAME <<'EOF'  as mcp_register, for a tool that changes the router:
 #   ...                              registered only in admin mode (MCP_ADMIN=1, launcher
 #   EOF                              --admin); otherwise its definition is read and
 #                                    dropped and a call is "Unknown tool". Such tools
@@ -663,6 +666,10 @@ mcp_register() {
 	cat >"$MCP_TMP/tools/$(printf '%03d' "$_mcp_ntools")-$1.json"
 	MCP_TOOLS="$MCP_TOOLS $1"
 }
+# mcp_own_timeout NAME: the tool's integer argument "timeout" (seconds) raises the call
+# limit to that plus 5 s when it is longer than MCP_CALL_TIMEOUT
+MCP_OWN_TIMEOUT=
+mcp_own_timeout() { MCP_OWN_TIMEOUT="$MCP_OWN_TIMEOUT $1"; }
 mcp_register_admin() {
 	if [ "$MCP_ADMIN" = 1 ]; then mcp_register "$1"; else cat >/dev/null; fi
 }
@@ -732,9 +739,10 @@ _mcp_tools_call() { # ID
 	fi
 	mcp_log "call $_name"
 
-	# the exec tool brings its own timeout; the call limit is at least that plus 5 s
+	# tools marked with mcp_own_timeout (exec, the write tools) bring their own timeout
+	# argument; the call limit is at least that plus 5 s
 	_ct_to=$MCP_CALL_TIMEOUT
-	if [ "$_name" = exec ]; then
+	if case " $MCP_OWN_TIMEOUT " in *" $_name "*) true ;; *) false ;; esac then
 		_ct_x=$(_mcp_jf -e @.params.arguments.timeout)
 		case $_ct_x in '' | *[!0-9]* | ?????*) ;; *) [ $((_ct_x + 5)) -gt "$_ct_to" ] && _ct_to=$((_ct_x + 5)) ;; esac
 	fi
@@ -885,7 +893,7 @@ tool_server_info() {
 	printf 'trusted tools %s\n' "$MCP_TRUSTED"
 	printf 'redaction     %s\n' "$([ "$MCP_REDACT" = 1 ] && echo on || echo off)"
 	printf 'max output    %s bytes per result (more is cut while the tool runs)\n' "$MCP_MAX_OUTPUT"
-	printf 'call timeout  %s s per call (exec: its own timeout + 5 s when that is longer)\n' "$MCP_CALL_TIMEOUT"
+	printf 'call timeout  %s s per call (%s: own timeout + 5 s when longer)\n' "$MCP_CALL_TIMEOUT" "$(printf '%s' "$MCP_OWN_TIMEOUT" | sed 's/^ //; s/ /,/g')"
 	printf 'text          UTF-8; invalid bytes shown as U+FFFD, NUL bytes dropped\n'
 	printf 'firmware root %s\n' "$MCP_ROM"
 	printf 'overlay upper %s\n' "$MCP_UPPER"

@@ -11,6 +11,7 @@ mcp_register exec <<'EOF'
 "required":["command"],"additionalProperties":false},
 "annotations":{"title":"Run a shell command as root","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}}
 EOF
+mcp_own_timeout exec
 # _x_to is set by arg_int (eval), _rt_fired by run_timeout (server/00-core.sh)
 # shellcheck disable=SC2154
 tool_exec() {
