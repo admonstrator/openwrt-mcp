@@ -85,9 +85,11 @@ second server next to the read-only one, so each keeps its own permissions:
 | `uci_change` | uci operations on one package, with dry run, commit and reload |
 | `service_control` | Status, start, stop, restart, reload, enable, disable of an init script |
 
-Every write call reports what changed in `/etc/config`. Calls that can cut off your
-access, expose the router or reset, flash or reboot it run only with `confirm: true`,
-which Claude is told to set only after you agreed to that exact call. There is no
+Write calls report what changed in `/etc/config` (not other files such as
+`/etc/hosts`). Calls classed as risky, because they can cut off your access, open the
+router or the LAN, or reset, flash or reboot it, run only with `confirm: true`, which
+Claude is told to set only after you agreed to that exact call. The classes come from
+fixed lists, not from understanding each change: read what Claude proposes. There is no
 automatic rollback: a change that cuts the SSH connection stays. Without `--admin` the
 write modules are not even part of the script. Do not use admin mode on a router you
 suspect to be compromised.

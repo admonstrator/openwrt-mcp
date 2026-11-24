@@ -492,11 +492,10 @@ redact() {
 		}
 		return out s
 	}
-	# a whole key on one line (JSON answers keep newlines as \n): mask it in place
+	# a whole key on one line (JSON answers keep newlines as \n): mask it in place, then
+	# let the line go through the other rules (a BEGIN left over starts a block)
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----.*-----END [A-Z ]*PRIVATE KEY-----/ {
-		line = $0
-		gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*-----END [A-Z ]*PRIVATE KEY-----/, "<redacted private key>", line)
-		print line; next
+		gsub(/-----BEGIN [A-Z ]*PRIVATE KEY-----.*-----END [A-Z ]*PRIVATE KEY-----/, "<redacted private key>")
 	}
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { print; inkey = 1; next }
 	inkey && /-----END [A-Z ]*PRIVATE KEY-----/ { print "<redacted>"; print; inkey = 0; next }

@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from mcp_client import ADMIN_ENV, ADMIN_TOOLS, OpenWrtTestCase, needs_container
+from mcp_client import ADMIN_ENV, ADMIN_TOOLS, REMOTE_SCRIPT, OpenWrtTestCase, build_server, needs_container
 
 # the core helpers, called from a throwaway tool module that tests add to the server
 HELPER_SHIM = r"""
@@ -124,6 +124,19 @@ class TestHelpers(OpenWrtTestCase):
         self.assertIn("<redacted private key>", out)
         self.assertIn('"x": 1', out)
         self.assertIn('"after": "visible"', out)
+        # a second BEGIN without END on that line starts a block: what follows is hidden
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            printf '%s\n' 'a -----BEGIN PRIVATE KEY-----k1-----END PRIVATE KEY----- b -----BEGIN PRIVATE KEY-----' \
+              'MIIsecond' '-----END PRIVATE KEY-----' 'tail' | redact""")
+        self.assertNotIn("k1", out)
+        self.assertNotIn("MIIsecond", out)
+        self.assertIn("tail", out)
+        # the rest of a masked line still goes through the other rules (uci show)
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            printf '%s\n' "x.y.key='-----BEGIN PRIVATE KEY-----k-----END PRIVATE KEY----- hunter2'" | redact""")
+        self.assertNotIn("hunter2", out)
 
     @needs_container
     def test_lib_sockets(self):
@@ -173,6 +186,27 @@ class TestAdminMode(OpenWrtTestCase):
                     else:
                         r = s.request("tools/call", {"name": "t_admin", "arguments": {}})
                         self.assertEqual(r["error"]["code"], -32602)
+                    s.close()
+        finally:
+            self.container.push_server()
+
+    @needs_container
+    def test_read_only_build_runs(self):
+        # the script the launcher ships without --admin: no write tool, even if MCP_ADMIN
+        # were set by hand, and the read-only tools work
+        self.container.put(REMOTE_SCRIPT, build_server(admin=False))
+        try:
+            for env in ({}, ADMIN_ENV):
+                with self.subTest(env=env):
+                    s = self.new_session(env)
+                    s.initialize()
+                    names = [t["name"] for t in s.request("tools/list")["result"]["tools"]]
+                    for t in ADMIN_TOOLS:
+                        self.assertNotIn(t, names)
+                    self.assertIn("glinet", names)
+                    self.assertEqual(names[-1], "exec")
+                    text, err = s.call_tool("system_info")
+                    self.assertFalse(err, text)
                     s.close()
         finally:
             self.container.push_server()
