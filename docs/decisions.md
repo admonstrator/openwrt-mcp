@@ -21,4 +21,4 @@
 
 ## Rauchprobe Phase 1
 
-Am 2026-11-24 an einem GL.iNet GL-BE14000 (Firmware 4.11.0 beta5, OpenWrt 25.12-SNAPSHOT, aarch64), nur lesende Werkzeuge, kein `exec`: alle 19 Lesewerkzeuge ohne Fehler, je 0,1 bis 6,3 s, Start 0,4 s; 123 Applets aus `/rom`; WLAN-Schlüssel und Hash maskiert; danach nichts in `/tmp` des Routers. Das Audit meldet 2 high, 1 medium, 3 low, 3 info, alle zu Änderungen, die der Besitzer selbst gemacht hat oder die die Firmware beim ersten Start schrieb.
+Am 2026-11-24 an einem GL.iNet GL-BE14000 (Firmware 4.11.0 beta5, OpenWrt 25.12-SNAPSHOT, aarch64), nur lesende Werkzeuge, kein `exec`: alle 19 Lesewerkzeuge ohne Fehler, je 0,1 bis 6,3 s, Start 0,4 s; 123 Applets aus `/rom`; WLAN-Schlüssel und Hash maskiert; danach nichts in `/tmp` des Routers. Das Audit meldet 2 high, 1 medium, 3 low, 3 info, zu Änderungen nach dem ersten Start (Tailscale-Programme, `samba4`-Init-Skript, `cloudflared.new`, SSH-Schlüssel, nftables-Datei) und als INFO zu dem, was die Firmware beim ersten Start schrieb.
