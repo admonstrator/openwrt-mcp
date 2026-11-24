@@ -532,5 +532,108 @@ a multiset: a renumbered anonymous section shows up as removed plus added.
 
 ### uci_change and service_control
 
-(written by the owner of server/65-admin-uci.sh)
+(server/65-admin-uci.sh; any OpenWrt, admin mode only.) Annotations of both:
+`readOnlyHint` false, `destructiveHint` true, `openWorldHint` false; both bring their own
+`timeout` (`mcp_own_timeout`), so the call limit is at least `timeout` + 5 s.
+
+#### `uci_change`
+
+Applies a list of uci operations to one package in `/etc/config`, commits it and lets
+procd reload what depends on it.
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `package` | string, required | | file name in `/etc/config`: letters, digits, `_`, `-`, not starting with `-`; the file must exist |
+| `changes` | array, required | | 1 to 100 operations `{"op", "path", "value"}`, applied in order |
+| `dry_run` | boolean | false | only show what would change; nothing is written |
+| `reload` | boolean | true | after the commit, let procd reload the services whose configuration changed |
+| `confirm` | boolean | false | needed for risky changes (below), set only after the user agreed |
+| `timeout` | integer 1–300 | 30 | seconds for the reload step (`reload_config`) |
+
+Operations (`path` is relative to the package; a section is a name of letters, digits
+and `_`, or `@type[N]` with N up to 4 digits, negative counts from the end, so
+`@rule[-1]` is a rule an earlier `add` created):
+
+| `op` | `path` | `value` | uci command |
+| --- | --- | --- | --- |
+| `set` | `section.option` | the value | `uci set pkg.section.option=value` |
+| `set` | `section` | section type | creates a named section (`uci set pkg.section=type`) |
+| `delete` | `section.option` or `section` | none | `uci delete`; a whole section is risky |
+| `add_list` | `section.option` | one element | `uci add_list` |
+| `del_list` | `section.option` | one element | `uci del_list` (an element that is not there is no error, as in uci) |
+| `add` | none | section type | `uci add pkg type`; the result names the new section (`cfgXXXXXX`) |
+
+Order of work:
+
+1. **Validation** of every operation (op, path syntax, `value` present exactly where
+   needed and a JSON string, no members other than `op`, `path`, `value`). Values are
+   passed to uci as one argv word each, never through the shell: spaces, quotes, `;`,
+   `$()`, backticks arrive literally. A value with a line break (`\n`, `\r`) is refused:
+   uci would store it, but `uci show`, `reload_config` and every line-based reader
+   (including this server's) would misread it.
+2. **Risk check.** Without `confirm: true` a real run is refused with an error that names
+   the risk, shows the plan and asks to get the user's agreement and resend with
+   `confirm: true`. Risky: every change to the packages `network`, `firewall`,
+   `wireless`, `dropbear`, `uhttpd`, `nginx`, `rpcd`, `oui-httpd`, `wan-access`, `rtty`,
+   `glconfig`, `tailscale`, `zerotier` (they can cut off access to the router or expose
+   it); a change of `system` option `ttylogin` (login on the serial console); every
+   `delete` of a whole section, in any package. A dry run needs no confirm and lists the
+   risk under `== Risk`.
+3. **Uncommitted changes** of someone else in the package (`uci changes PKG` not empty):
+   a real run is refused and lists them (redacted), because the commit would apply them
+   too. A dry run works and lists them as a warning.
+4. **Private copy.** The package file is copied below the call's work directory and every
+   operation runs there first (`uci -c COPY -t SAVE`, on 25.12 also `-C` with an empty
+   override directory). If uci refuses one (missing section, bad index), the result is
+   `invalid operation, nothing was changed: change N (op): uci refused it: ...` and
+   nothing in `/etc/config` or `/tmp/.uci` was touched.
+5. **Dry run** stops here: `== Dry run: lines that would change (nothing was written)`
+   with `config PKG: N removed, M added` and the `uci show` lines (`  - ` before,
+   `  + ` after, redacted, at most 200).
+6. **Real run**: `lib_cfg_snapshot`, the operations with uci (if one fails now, `uci
+   revert PKG` and an error: nothing committed), `uci commit PKG`, then the reload:
+   - procd not answering on ubus (no socket, as in containers): `NOT APPLIED: the change
+     is committed ... but no service was reloaded`;
+   - `reload_config` present and `/var/run/config.md5` there (written at boot): it runs
+     under `timeout`; procd reloads every service whose configuration changed since the
+     last `reload_config`, in the background;
+   - otherwise (no `reload_config`, or no md5 file to compare against) the server sends
+     procd the `config.change` event for the package itself (`ubus call service event`),
+     which is what `reload_config` does per changed package.
+   `reload: false` commits only and says so.
+
+Output: `== Plan: N operation(s) on /etc/config/PKG` (one line per operation, `N op
+pkg.path='value'`, redacted), then for a real run `== Applied` (`committed ...`, new
+section names), `== Reload` (`reload_config`, `procd/ubus`, `result` lines) and `== Changes
+in /etc/config` (`lib_cfg_changes`, at most 200 lines per package). On GL.iNet firmware
+(`/etc/glversion`) a last `== Note` says that `glinet_api` keeps the GL web UI in sync and
+that GL services may overwrite or ignore direct uci edits of GL-managed packages.
+
+Limits: no rollback timer (unlike LuCI's apply/confirm): a change that cuts the SSH
+connection stays committed, which is why such packages need `confirm`. Only existing
+packages; `rename` and `reorder` are not offered.
+
+#### `service_control`
+
+| Argument | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `service` | string, required | | script name in `/etc/init.d` (letters, digits, `_ . -`, not starting with `.` or `-`, no path); it must be a regular file |
+| `action` | string, required | | `status`, `start`, `stop`, `restart`, `reload`, `enable`, `disable` |
+| `confirm` | boolean | false | needed for risky actions |
+| `timeout` | integer 1–300 | 30 | seconds, then the init script and everything it started in the foreground are killed |
+
+- `status` reads only: `enabled  yes (/etc/rc.d/S..NAME)` or `no`, and `running` from
+  procd (`ubus call service list`): number of running instances, `no`, or `unknown
+  (ubus or procd not available)`.
+- Other actions run `/etc/init.d/NAME ACTION` from `/` with stdin `/dev/null` and print
+  its output (redacted, at most 200 lines), `[exit N]` (a non-zero exit is not an error
+  result) or `[timeout after N s]` (error result), then `== Status of NAME`. The script
+  runs without the call's `MCP_CALL_TAG`, so daemons it starts outside procd are not
+  killed with the call and are not hidden from `audit`.
+- Risky (need `confirm: true`): `stop`, `restart`, `disable` of `network`, `firewall`,
+  `dropbear`, `sshd`, `uhttpd`, `nginx`, `rpcd`, `ubus`, `odhcpd`, `dnsmasq`,
+  `gl-ngx-session`, `wpad`, `hostapd`, `tailscale`, `zerotier`, `openvpn`.
+- Refused for every action but `status`: `boot`, `done`, `umount`, `sysfixtime` (they
+  run only at boot or shutdown; `umount` unmounts the filesystems, disabling `boot`
+  breaks the next boot). `sysntpd` is an ordinary daemon and allowed.
 
