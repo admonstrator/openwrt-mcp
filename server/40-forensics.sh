@@ -397,6 +397,7 @@ tool_persistence() {
 			case $ty$path in
 			f*) ;;
 			l/etc/rc.d/*) continue ;;
+			l/tmp/* | l/var/* | l/run/* | l/dev/shm/*) ;; # already on the RAM disk itself
 			l*)
 				case $(readlink -f "$path" 2>/dev/null) in
 				/tmp/* | /var/* | /dev/shm/* | /run/*) echo "      !! a link to the RAM disk: the content can be swapped without touching the flash" ;;
