@@ -276,9 +276,153 @@ fo_keyfiles() {
 	return 0
 }
 
+# ---------------------------------------------------------------- live crontabs
+# What runs from cron is what the running crond reads: its -c directory (GL.iNet:
+# /tmp/gl_crontabs, generated at boot), not necessarily /etc/crontabs (decision 2.6).
+# Command lines come from MCP_PROC (default /proc), so the tests can use fixtures.
+
+# fo_procs_by_comm ERE: "pid<TAB>comm<TAB>cmdline" for every process under MCP_PROC
+# whose comm matches the anchored ERE, the server's own processes (MCP_CALL_TAG) left
+# out. Control characters in comm and command line become "?" and spaces.
+fo_procs_by_comm() {
+	_fpp=${MCP_PROC:-/proc}
+	grep -H '' "$_fpp"/[0-9]*/comm 2>/dev/null | awk -v re="^($1)\$" '{
+		i = index($0, "/comm:"); if (!i) next
+		p = substr($0, 1, i - 1); sub(/.*\//, "", p); c = substr($0, i + 6); gsub(/[\001-\037\177]/, "?", c)
+		if (p ~ /^[0-9]+$/ && c ~ re) print p "\t" c }' >"$MCP_TMP/fo.procs"
+	if [ -s "$MCP_TMP/fo.procs" ]; then
+		_fpo=" $$ $(grep -lsF "MCP_CALL_TAG=$$." "$_fpp"/[0-9]*/environ 2>/dev/null | sed 's|/environ$||; s|.*/||' | tr '\n' ' ')"
+		while IFS="$FX_TAB" read -r _fpi _fpc; do
+			case $_fpo in *" $_fpi "*) continue ;; esac
+			printf '%s\t%s\t%s\n' "$_fpi" "$_fpc" "$(tr '\000-\037\177' ' ' <"$_fpp/$_fpi/cmdline" 2>/dev/null | sed 's/ *$//')"
+		done <"$MCP_TMP/fo.procs"
+	fi
+	rm -f "$MCP_TMP/fo.procs"
+}
+
+# fo_crond: one line per running crond, tab separated:  pid  dir  how  cmdline
+# dir is the crontab directory it reads: the argument of -c (also "-cDIR" and in an
+# option cluster such as "-fc DIR"), or busybox' default /var/spool/cron/crontabs (how:
+# "-c" or "default"; OpenWrt links that default to /etc/crontabs).
+fo_crond() {
+	fo_procs_by_comm crond | awk -F'\t' '
+	{
+		n = split($3, a, " "); dir = ""
+		for (i = 2; i <= n; i++) {
+			t = a[i]
+			if (t == "--") break
+			if (substr(t, 1, 1) != "-" || length(t) < 2) continue
+			for (j = 2; j <= length(t); j++) {
+				c = substr(t, j, 1)
+				# busybox crond: -l -L -c -d take a value, -f -b -S do not
+				if (index("lLcd", c)) {
+					v = substr(t, j + 1); if (v == "") v = a[++i]
+					if (c == "c") dir = v
+					break
+				}
+			}
+		}
+		print $1 "\t" ((dir == "") ? "/var/spool/cron/crontabs" : dir) "\t" ((dir == "") ? "default" : "-c") "\t" $3
+	}'
+}
+
+# fo_cron_dirs: one line per crontab directory of the running crond processes:
+#   dir  resolved  state  pids  cmdline
+# state: etc (resolves to /etc/crontabs, which the cron location lists anyway), missing
+# (no such directory: that crond runs nothing), live (read below). cmdline is that of the
+# first crond reading it.
+fo_cron_dirs() {
+	fo_crond >"$MCP_TMP/fo.crond"
+	cut -f2 "$MCP_TMP/fo.crond" | awk '!s[$0]++' | while IFS= read -r _fcd; do
+		_fcr=$(readlink -f "$_fcd" 2>/dev/null) || _fcr=
+		[ -n "$_fcr" ] || _fcr=$_fcd
+		if [ "$_fcr" = /etc/crontabs ]; then
+			_fcs=etc
+		elif [ -d "$_fcr" ]; then
+			_fcs=live
+		else
+			_fcs=missing
+		fi
+		awk -F'\t' -v d="$_fcd" -v r="$_fcr" -v s="$_fcs" '
+			$2 == d { if (p != "") p = p ","; p = p $1; if (c == "") c = $4 }
+			END { printf "%s\t%s\t%s\t%s\t%s\n", d, r, s, p, c }' "$MCP_TMP/fo.crond"
+	done
+	rm -f "$MCP_TMP/fo.crond"
+}
+
+# fo_cron_live_files DIRS: the files of the live directories in DIRS (fo_cron_dirs
+# output) and of their crontabs.d subdirectory, crond's cron.update marker left out.
+# Tab separated:  dir  path  type  mode  uid  gid  size  mtime  target
+# At most FO_PERSIST_MAX files per directory; a directory reached twice is read once.
+fo_cron_live_files() {
+	awk -F'\t' '$3 == "live" && !s[$2]++ { print $2 }' "$1" | while IFS= read -r _fcd; do
+		find "$_fcd" "$_fcd/crontabs.d" -maxdepth 1 ! -type d ! -name cron.update -print0 2>/dev/null |
+			fx_ls | head -n "$FO_PERSIST_MAX" | FX_D="$_fcd" awk "$FX_AWK_LS"'
+			{ if (fx_ls($0)) printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ENVIRON["FX_D"], F_path, F_type, F_mode, F_uid, F_gid, F_size, F_mtime, (F_target == "") ? "-" : F_target }'
+	done
+}
+
+# fo_ramdisk PATH: exit status 0 when PATH, or what it resolves to, lies on the RAM disk.
+fo_ramdisk() {
+	for _frp in "$1" "$(readlink -f "$1" 2>/dev/null)"; do
+		case $_frp in /tmp/* | /var/* | /run/* | /dev/shm/*) return 0 ;; esac
+	done
+	return 1
+}
+
+# fo_cron_live MAXLINES: the crontab directories of the running crond and, for those
+# outside /etc/crontabs, every file with its active lines (persistence, location cron).
+fo_cron_live() {
+	fo_cron_dirs >"$MCP_TMP/fo.cdirs"
+	if [ ! -s "$MCP_TMP/fo.cdirs" ]; then
+		echo "  running crond: none found in ${MCP_PROC:-/proc}; no crontab runs while crond is stopped"
+		rm -f "$MCP_TMP/fo.cdirs"
+		return 0
+	fi
+	while IFS="$FX_TAB" read -r _fcd _fcr _fcs _fcp _fcc; do
+		printf '  running crond (pid %s: %s) reads %s' "$_fcp" "$_fcc" "$_fcd"
+		[ "$_fcr" != "$_fcd" ] && printf ' -> %s' "$_fcr"
+		case $_fcs in
+		etc) echo ", that is /etc/crontabs (listed below)" ;;
+		missing) echo ", which does not exist: that crond runs nothing" ;;
+		*) echo ", outside /etc/crontabs; its files run as they are:" ;;
+		esac
+	done <"$MCP_TMP/fo.cdirs" | redact
+	fo_cron_live_files "$MCP_TMP/fo.cdirs" >"$MCP_TMP/fo.cfiles"
+	awk -F'\t' '$3 == "live" && !s[$2]++ { print $2 }' "$MCP_TMP/fo.cdirs" | while IFS= read -r _fcd; do
+		awk -F'\t' -v d="$_fcd" '$1 == d { f = 1 } END { exit !f }' "$MCP_TMP/fo.cfiles" ||
+			printf '  %s: (no files)\n' "$_fcd"
+	done
+	while IFS="$FX_TAB" read -r _fcd _fcf _fct _fcm _fcu _fcg _fcz _fct2 _fcl; do
+		_fgen=
+		if fo_ramdisk "$_fcf"; then
+			printf '  [RAM disk] %s' "$_fcf"
+			# what rebuilds it at boot is not known for sure; scripts that name the
+			# directory are the likely candidates
+			_fgen=$(find /etc/init.d -maxdepth 1 -type f 2>/dev/null | { cat; [ -f /etc/rc.local ] && echo /etc/rc.local; } |
+				while IFS= read -r _fgs; do rd "$_fgs" | grep -qF -- "$_fcd" && printf '%s ' "$_fgs"; done)
+		else
+			printf '  [live] %s' "$_fcf"
+		fi
+		[ "$_fcl" != - ] && printf ' -> %s' "$_fcl"
+		printf '  (%s %s %s:%s, %s bytes, %s' "$_fct" "$_fcm" "$_fcu" "$_fcg" "$_fcz" "$_fct2"
+		if fo_ramdisk "$_fcf"; then
+			if [ -n "$_fgen" ]; then
+				printf '; on the RAM disk, rebuilt at every boot by something else; generator unknown, scripts that name %s: %s' "$_fcd" "${_fgen% }"
+			else
+				printf '; on the RAM disk, rebuilt at every boot by something else; generator unknown'
+			fi
+		fi
+		printf ')\n'
+		case $_fct in f | l) [ "$1" -gt 0 ] && fx_show "$_fcf" "$1" ;; esac
+	done <"$MCP_TMP/fo.cfiles"
+	echo "  /etc/crontabs and /etc/cron.d:"
+	rm -f "$MCP_TMP/fo.cdirs" "$MCP_TMP/fo.cfiles"
+}
+
 fo_loc_title() {
 	case $1 in
-	cron) echo "scheduled jobs (/etc/crontabs)" ;;
+	cron) echo "scheduled jobs (/etc/crontabs, /etc/cron.d and the directory each running crond reads)" ;;
 	rc_local) echo "/etc/rc.local, run at the end of every boot" ;;
 	init) echo "init scripts (/etc/init.d), the links that enable them (/etc/rc.d), button handlers" ;;
 	inittab) echo "/etc/inittab, what procd starts first" ;;
@@ -334,7 +478,7 @@ fo_loc_extra() {
 }
 
 mcp_register persistence <<'EOF'
-{"name":"persistence","title":"Autostart and persistence","description":"Shows every place on the router from which code starts by itself or survives a firmware upgrade: cron, rc.local, init scripts and rc.d links, inittab, hotplug and DHCP/PPP hooks, uci-defaults, firewall includes, dnsmasq hooks, shell profiles, ld.so.preload, kernel module lists, sysupgrade keep lists, rpcd plugins, LuCI additions, package feeds, /etc/hosts and authorized keys. Each entry is marked against the firmware image (same, CHANGED, new); entries that differ are shown with their active lines, identical ones are only named. Use it to answer what starts on its own and from where.","inputSchema":{"type":"object","properties":{"locations":{"type":"array","items":{"type":"string","enum":["cron","rc_local","init","inittab","hotplug","uci_defaults","firewall","dnsmasq","profile","preload","modules","sysupgrade","rpcd","luci","feeds","hosts","ssh_keys"]},"description":"Only these locations. Default: all."},"only_changed":{"type":"boolean","description":"Leave out entries that are identical to the firmware image. Default false.","default":false},"max_lines":{"type":"integer","description":"Active lines shown per file (comments and blank lines are skipped). Default 40.","default":40,"minimum":0,"maximum":400}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"persistence","title":"Autostart and persistence","description":"Shows every place on the router from which code starts by itself or survives a firmware upgrade: cron (/etc/crontabs and the directory the running crond actually reads, such as /tmp/gl_crontabs on GL.iNet), rc.local, init scripts and rc.d links, inittab, hotplug and DHCP/PPP hooks, uci-defaults, firewall includes, dnsmasq hooks, shell profiles, ld.so.preload, kernel module lists, sysupgrade keep lists, rpcd plugins, LuCI additions, package feeds, /etc/hosts and authorized keys. Each entry is marked against the firmware image (same, CHANGED, new); entries that differ are shown with their active lines, identical ones are only named. Use it to answer what starts on its own and from where.","inputSchema":{"type":"object","properties":{"locations":{"type":"array","items":{"type":"string","enum":["cron","rc_local","init","inittab","hotplug","uci_defaults","firewall","dnsmasq","profile","preload","modules","sysupgrade","rpcd","luci","feeds","hosts","ssh_keys"]},"description":"Only these locations. Default: all."},"only_changed":{"type":"boolean","description":"Leave out entries that are identical to the firmware image. Default false.","default":false},"max_lines":{"type":"integer","description":"Active lines shown per file (comments and blank lines are skipped). Default 40.","default":40,"minimum":0,"maximum":400}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_persistence() {
 	arg_int maxl max_lines 40 0 400 || return 1
@@ -360,6 +504,7 @@ tool_persistence() {
 			echo "  note: more than $FO_PERSIST_MAX entries in $loc; only the first $FO_PERSIST_MAX were examined, the rest could hide an entry (list_dir and find_files show them all)"
 		fi
 		fo_loc_extra "$loc"
+		[ "$loc" = cron ] && fo_cron_live "$maxl"
 		awk -F'\t' -v l="$loc" '$1 == l' "$rec" >"$rec.l"
 		if [ ! -s "$rec.l" ]; then
 			echo "  (no files)"
