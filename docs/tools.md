@@ -79,7 +79,7 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MCP_ROM` | `/rom` | firmware image root; its `bin/busybox` goes first in PATH when it runs |
+| `MCP_ROM` | `/rom` | firmware image root; when its `bin/busybox` runs, every applet of it (and its `usr/bin/jsonfilter`, when that works) goes first in PATH: `server_info` shows it as trusted tools |
 | `MCP_UPPER` | `/overlay/upper` | overlay upper directory |
 | `MCP_REDACT` | `1` | `0` turns masking of secrets off (launcher `--no-redact`) |
 | `MCP_MAX_OUTPUT` | `60000` | bytes per result (launcher `--max-output`) |
