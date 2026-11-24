@@ -62,7 +62,6 @@ rules() {
 # class object.method reason
 #
 # --- named like a query, but not one (-> a) ---
-a tailscale.get_auth_url restarts Tailscale
 a ddns.get_status contacts the GL.iNet DDNS service
 a upgrade.check_firmware_online contacts the GL.iNet firmware servers
 a upgrade.check_cellular_online contacts the GL.iNet firmware servers
@@ -94,6 +93,8 @@ r rtty.set_config allows remote SSH or web access through the rtty broker
 r rtty.run opens an outgoing remote terminal connection to a broker
 r acl.add_user gives a web interface account access rights
 r acl.add_acl extends the access rights of a web interface group
+r rtty.stop ends the remote terminal connection someone may be working through
+r ui.set_inited_internet writes any option it is given into glconfig.general
 #
 # --- opens the router or the network to the WAN (-> r) ---
 r firewall.set_wan_access opens or closes ping, HTTPS and SSH access to the router from the WAN
@@ -115,6 +116,23 @@ r tailscale.set_config turns Tailscale on or off and decides what the tailnet ma
 r zerotier.set_config joins a ZeroTier network and decides what it may reach; restarts it
 r s2s.set_config links the LAN to a remote site through WireGuard
 r vpn-client.set_tap_s2s bridges the LAN to a remote site (OpenVPN TAP)
+r firewall.order_port_forward changes which port forward wins and the priority of the DMZ
+r network.set_advance_config turns full cone NAT and SIP ALG on or off, which loosens or tightens what the WAN can reach
+r nas-web.add_user creates a file sharing account
+r nas-web.add_share shares a folder over Samba or WebDAV, possibly without login
+r nas-web.set_share changes who can reach a shared folder
+r wg-server.set_peer changes a VPN client (its key, address or state): another device may get in, the old one is cut off
+r wg-server.generate_peer generates a new key pair and client config for a VPN client
+r wg-server.generate_key generates a new key pair for the WireGuard server
+r wg-server.set_setting changes what VPN clients may reach (local access, client to client, masquerading)
+r wg-server.add_route adds a route for the VPN server tunnel: more of the network becomes reachable through it
+r wg-server.set_route changes a route of the VPN server tunnel
+r ovpn-server.set_setting changes what VPN clients may reach (local access, masquerading)
+r ovpn-server.add_route adds a route for the VPN server tunnel: more of the network becomes reachable through it
+r ovpn-server.set_route changes a route of the VPN server tunnel
+r ovpn-server.export_config writes a client config with its key, which lets its holder in
+r ipv6.set_ipv6 turns IPv6 on or off for LAN and WAN and restarts the network
+r adguardhome.set_config starts or stops AdGuard Home and can send all DNS queries of the network through it
 #
 # --- can cut the user's own way to the router or the router's uplink (-> r) ---
 r wifi.set_config changes or turns off a Wi-Fi network: devices on it are disconnected and need the new settings
@@ -133,6 +151,49 @@ r vpn-client.set_options changes VPN client options including the kill switch, w
 r vpn-client.set_default_tunnel decides whether traffic outside the VPN policies passes or is blocked
 r vpn-client.set_global_mode switches between global and policy VPN mode for all clients
 r lpm.set_config sets sleep and shutdown timers: the router can switch itself off
+r timer.set_reboot makes the router reboot on a schedule
+r tailscale.get_auth_url restarts Tailscale and asks for a new login: access through the tailnet drops
+r repeater.connect switches the Wi-Fi uplink to another network
+r repeater.set_config changes auto-reconnect and band lock of the Wi-Fi uplink
+r repeater.exit_bare_mode switches the repeater out of bare mode
+r modem.set_connect starts the cellular connection: the uplink can switch, and data can cost money
+r modem.set_sim_config replaces the APN and network settings of a SIM: the cellular uplink can go down
+r modem.set_slot_failover_config switches the active SIM or the failover between SIMs
+r modem.set_cell_tower locks the modem to one cell: without that cell there is no cellular uplink
+r modem.set_operator_config locks the modem to one operator: without it there is no cellular uplink
+r modem.set_3gpp_rel changes the modem's 3GPP release and needs a reboot
+r modem.set_traffic_config sets a data limit, after which the cellular uplink can be cut
+r tethering.set_connect switches the uplink to a USB tethering device
+r kmwan.set_config changes failover or load balancing and the order of the uplinks
+r kmwan.set_interface changes how an uplink is checked: it can be taken for offline
+r mptun.set_config turns uplinks of the multi-path tunnel on or off
+r otg.set_config changes the data and power roles of the USB-C ports: a USB uplink or the power supply can drop
+r system.set_usb_config switches the USB mode: a USB modem or tethering uplink drops
+r wifi.set_environment_config switches indoor/outdoor operation and reloads Wi-Fi: all Wi-Fi devices are disconnected
+r dns.set_config changes the DNS mode and servers for the whole network: with a wrong one no name resolves
+r dns.set_host replaces the whole /etc/hosts and restarts dnsmasq
+r tor.set_config sends the network's traffic through Tor (or stops that) and rewrites the firewall rules
+r vpn-client.add_tunnel adds a VPN policy with its kill switch: traffic can be rerouted or blocked
+r vpn-client.set_tunnel changes or disables a VPN policy with its kill switch: traffic can be rerouted or blocked
+r vpn-client.order_tunnel changes which VPN policy applies first
+r vpn-client.set_single_mac moves one device into or out of VPN tunnels
+r vpn-client.start_random_client connects a VPN client: traffic is rerouted through it
+r vpn-client.stop disconnects a VPN client: traffic goes out directly or is blocked by the kill switch
+r wg_client.start_random_client connects a WireGuard client: traffic is rerouted through it
+r wg_client.generate_provider_config generates provider peers and removes the ones no longer selected
+r wg_client.update_provider_config replaces the keys and settings of provider peers that may be in use
+r wg-client.set_config changes a WireGuard client config that may be in use
+r wg-client.set_group changes a WireGuard group's name or stored credentials
+r ovpn-client.set_config changes an OpenVPN client config that may be in use
+r ovpn-client.set_group changes an OpenVPN group's name or stored credentials
+r parental-control.set_config turns parental control on or off for the network
+r parental-control.set_mode switches the parental control concept
+r parental-control.add_group puts devices under a blocking rule
+r parental-control.set_group changes which devices a blocking rule applies to, possibly the user's own
+r parental-control.add_rule adds a blocking rule
+r parental-control.set_rule changes a blocking rule that may be in use
+r parental-control.set_brief applies another rule to a group for a while
+r screen.reset_unlock_attempts resets the failed-attempt lockout of the display passcode
 #
 # --- software, credentials, things that cost money or reach third parties (-> r) ---
 r plugins.install_package installs software on the router

@@ -646,7 +646,7 @@ one in `PATH`; there is no environment variable that points the tool elsewhere.
 **The catalog** holds 52 objects and 368 methods from the API documentation
 (github.com/admonstrator/glinet-api, GL-E5800, firmware 4.8.5): per method the summary,
 a class, the reason for the class and the parameters (name, type, required, enum, the
-description cut at 160 characters), ASCII only, about 105 kB of the admin script. It is
+description cut at 160 characters), ASCII only, about 108 kB of the admin script. It is
 generated, never edited: `scripts/glinet-methods.sh /path/to/glinet-api` (POSIX sh and
 awk) rewrites `server/61-admin-glinet-catalog.sh`; the same documentation gives the same
 bytes, and the file names the documentation commit. The class of a method is, in this
@@ -659,31 +659,56 @@ order:
 4. a name starting with `get_`, `check_` or `load_`: query;
 5. everything else: active.
 
-The rules table makes active what is named like a query but is none (18 methods:
-`tailscale.get_auth_url` restarts Tailscale, `ddns.get_status`,
-`upgrade.check_firmware_online`, `ui.get_remote_langs` and others go to the internet,
-`*.check_config` unpack uploads), and makes CONFIRM what the documentation does not mark
-destructive but that can change who controls the router or whether the user still
-reaches it: GoodCloud (`cloud.set_config`, `bind_device`, `rebind`, `unbind`,
-`bind_info`), rtty, web accounts (`acl.add_user`, `add_acl`); openings towards the WAN
-(`firewall.set_wan_access`, `set_dmz`, `add_rule`, `set_rule`, `add_port_forward`,
-`set_port_forward`, NAS sharing, starting or re-keying a VPN server, new VPN peers and
-logins, `tailscale.set_config`, `zerotier.set_config`, site-to-site); the user's own way
-in and the uplink (`wifi.set_config`, `wifi.set_mlo_config`, `timer.set_wifi`,
-`black_white_list.set_single_mac`, `cable.set_config`, `cable.set_port_config`,
-`edgerouter.set_config`, disconnecting repeater, modem or tethering, `tailscale.logout`,
-`wg-server.stop`, the VPN client's kill switch, default tunnel and global mode,
-`lpm.set_config`); software and feeds (`plugins.install_package`, `plugins.set_config`,
-`luci.install_luci`); credentials, money and third parties (`nas-web.set_user_pwd`,
-`screen.set_config`, `modem.set_sim_pin_code`, `modem.send_sms`, SMS forwarding,
-`wg_client.create_provider_account`). In all: 140 query, 129 active, 99 CONFIRM. A rule
-that names a method the documentation no longer has stops the generator.
+The rules table makes active what is named like a query but is none (17 methods:
+`ddns.get_status`, `upgrade.check_firmware_online`, `ui.get_remote_langs` and others go
+to the internet, `*.check_config` unpack uploads), and makes CONFIRM what the
+documentation does not mark destructive. The question asked of every changing method
+is: can it cut the owner off, open the router or the LAN to someone, switch or drop the
+uplink, reboot or switch off on a schedule, change credentials, cost money or reach a
+third party? That covers:
+
+- remote management and ownership: GoodCloud (`cloud.set_config`, `bind_device`,
+  `rebind`, `unbind`, `bind_info`), rtty (`run`, `set_config`, `stop`), web accounts
+  (`acl.add_user`, `add_acl`), `ui.set_inited_internet` (writes any option into
+  `glconfig.general`);
+- openings: `firewall.set_wan_access`, `set_dmz`, `add_rule`, `set_rule`,
+  `add_port_forward`, `set_port_forward`, `order_port_forward`,
+  `network.set_advance_config`, `ipv6.set_ipv6`, NAS protocols, users and shares, every
+  changing method of `wg-server` and `ovpn-server` except `generate_publickey` (start,
+  stop, config, settings such as `local_access`, peers, logins, routes, keys, exported
+  client configs), `tailscale.set_config`, `tailscale.get_auth_url` (restarts Tailscale
+  and asks for a new login), `zerotier.set_config`, `tor.set_config`, site-to-site;
+- the user's own way in and the uplink: `wifi.set_config`, `set_mlo_config`,
+  `set_environment_config`, `timer.set_wifi`, `timer.set_reboot`, `lpm.set_config`,
+  `black_white_list.set_single_mac`, parental control (everything that sets groups,
+  rules, mode), `cable.set_config`, `set_port_config`, `edgerouter.set_config`,
+  `kmwan.set_config`, `set_interface`, `mptun.set_config`, `dns.set_config`,
+  `dns.set_host`, `adguardhome.set_config`, repeater (connect, disconnect, config, bare
+  mode), modem (connect, disconnect, SIM config and failover, cell and operator lock,
+  3GPP release, traffic limit), tethering, `otg.set_config`, `system.set_usb_config`,
+  the VPN client's tunnels, order, kill switch, default tunnel, global mode, start and
+  stop, changes to client configs and groups that may be in use;
+- software and feeds: `plugins.install_package`, `plugins.set_config`,
+  `luci.install_luci`;
+- credentials, money, third parties: `nas-web.set_user_pwd`, `screen.set_config`,
+  `screen.reset_unlock_attempts`, `modem.set_sim_pin_code`, `modem.send_sms`, SMS
+  forwarding, `wg_client.create_provider_account`.
+
+In all: 140 query, 67 active, 161 CONFIRM. What stays active adds something that is not
+in use yet (a VPN client config or group, a DHCP reservation), sets display, LED, time
+zone, language, QoS or log options, scans, or only goes to the internet.
+`tests/test_glinet_api.py` holds two hand-written lists, independent of the rules table:
+the methods that must be CONFIRM, and the complete set that may be active; a method that
+turns active through a rule or a new documentation fails the test until it was looked
+at. A rule that names a method the documentation no longer has stops the generator.
 
 **A call** (`object` and `method`) goes through these checks; the first that fails ends
 it with `isError` and nothing sent to the API:
 
-1. `object` is not in `/usr/lib/oui-httpd/rpc` (when that can be listed):
-   `OBJECT.METHOD: not called. This router has no API object ...`.
+1. `object` has no file in `/usr/lib/oui-httpd/rpc`: `OBJECT.METHOD: not called. This
+   router has no API object ...`. When that directory is missing or empty, no object
+   counts as present and nothing is called: `not called. /usr/lib/oui-httpd/rpc cannot
+   be listed ...` (the listing still shows the catalog).
 2. Class CONFIRM without `confirm: true`: `OBJECT.METHOD: NOT CALLED, it needs
    confirmation. Nothing was changed.`, then `What it does:`, `Why confirmation:`, what
    to ask the user and to send the same call again with `"confirm": true`, and the
@@ -715,17 +740,23 @@ the call; ...)` with the output of `lib_cfg_changes` (also after an error or a
 timeout), and last `== Answer`: the reply as `ubus` printed it, masked. Status and
 changes come first, so the output cap cuts only the answer.
 
-**Secrets**: with redaction on, the values of answer members named like secrets are
-replaced by `"<redacted>"` whatever their JSON type (also a whole object or array):
-names containing `password`, `passwd`, `pwd`, `passphrase`, `passcode`, `secret`,
-`credential`, `private_key`, `preshared_key`; names ending in `key`, `psk`, `pass`,
-`token`, `sid` as a word; `pin`, `puk`, `pin_code`, `puk_code`. Not masked: `public_key`
-and booleans (`presharedkey_enable`). Inside longer strings (a WireGuard or OpenVPN client config)
-`PrivateKey = ` and `PresharedKey = ` values and PEM private key blocks (`<redacted
-private key>`) are masked, and so are the members with such names in JSON text that
-sits inside a string (`\"password\":\"...\"`). The core `redact` runs after that. A client config with its
-keys can therefore only be fetched with `--no-redact` or in the web interface. The
-params of a call are never printed back.
+**Secrets**: with redaction on, the value of every answer member whose name is that
+of a secret is replaced by `"<redacted>"`, whatever its JSON type: string, number, a
+whole object or array; only `true`, `false` and `null` stay. The names are those
+`redact` knows (section 2: `password`, `passwd`, `pwd`, `passphrase`, `secret`, `token`,
+`credential`, `psk` anywhere in the name; a word `pass`, `pin`, `community`, `keys` or one
+ending in `key`, so also `wps_pin`, `authkey`, `private_key`; not `public_key`,
+`key_mgmt`, `key_id`), plus `passcode`, `sid` and `puk`. Inside longer strings (a
+WireGuard or OpenVPN client config) `PrivateKey = ` and `PresharedKey = ` values and PEM
+private key blocks (`<redacted private key>`) are masked, and so are the members with
+such names in JSON text that sits inside a string (`\"password\":\"...\"`). Running
+text from the router gets the same treatment: in the GL error message, an `err_msg`,
+what `ubus` wrote to stderr and every string value of the answer, the value in
+`name=value`, `name: value`, `name = value` and `name "value"` (also `'value'`, to the
+closing quote) is masked when the name is that of a secret, so `bad value
+password=...` shows as `password=<redacted>`. The core `redact` runs last. A client
+config with its keys can therefore only be fetched with `--no-redact` or in the web
+interface. The params of a call are never printed back.
 
 Limits: the catalog describes one model and firmware; fields and methods of other
 versions differ, and the router's answer decides. The config report sees `/etc/config`
