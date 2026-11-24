@@ -17,7 +17,9 @@
 #                                    /dev/null) and returns 0. A non-zero return, or
 #                                    "tool_error MSG; return", marks the result isError.
 #                                    It runs in a subshell: it may cd, set variables and
-#                                    exit without harming the server.
+#                                    exit without harming the server. It starts in
+#                                    $MCP_TMP/work, which is emptied before every call:
+#                                    scratch files there never leak into the next call.
 #
 # Helpers a handler may use (and nothing else from this file):
 #   arg VAR NAME [DEFAULT]           string argument into VAR (default if absent or null)
@@ -30,8 +32,8 @@
 #   section TITLE                    print a "== TITLE" heading
 #   have CMD                         exit status 0 when CMD can be run
 #   rd PATH                          cat PATH only when it is a regular file that is safe
-#                                    to read to the end (no FIFO, no link into /proc,
-#                                    /sys or /dev)
+#                                    to read to the end (no FIFO, no link anywhere in
+#                                    the path into /proc, /sys or /dev)
 #   in_rom PATH                      exit status 0 when PATH exists in the firmware image
 #   rom_path PATH                    print PATH's location inside the firmware image
 #   redact                           filter: masks secrets unless redaction is off
@@ -56,9 +58,11 @@
 # ---------------------------------------------------------------- how a call runs
 # The arguments are checked against the tool's inputSchema first (unknown names, JSON
 # types, required ones); a mismatch is a tool result with isError, not a protocol error.
-# The handler then runs in a background subshell that writes into a FIFO. A reader
-# copies at most MCP_MAX_OUTPUT+1 bytes into $MCP_TMP/out and, when that limit is hit,
-# stops the producer: a tool that prints 50 MB never fills /tmp. A watchdog kills the
+# The handler then runs in a background subshell, in an emptied $MCP_TMP/work, and
+# writes into a FIFO. A reader (cat under a file size limit) copies a little more than
+# MCP_MAX_OUTPUT bytes into $MCP_TMP/out and, when that limit is hit, stops the
+# producer: a tool that prints 50 MB never fills /tmp. The text is cut again where its
+# escaped JSON form reaches MCP_MAX_OUTPUT bytes. A watchdog kills the
 # call's whole process tree after MCP_CALL_TIMEOUT seconds. Every process a call starts
 # carries MCP_CALL_TAG in its environment, so the watchdog also catches children that
 # left the tree (daemonized). The result text is checked as UTF-8: invalid bytes become
@@ -107,45 +111,98 @@ mcp_log() { [ "$MCP_DEBUG" = 1 ] && printf 'openwrt-mcp: %s\n' "$*" >&2; return 
 # ---------------------------------------------------------------- trusted tools
 # A compromised router may have replaced applets in the overlay. Every tool call runs
 # with the busybox of the firmware image first in PATH when the image has one, and
-# with the image's jsonfilter when that works. The links are made with the image's own
-# ln (the overlay's may be replaced too). MCP_PATH_ORIG keeps the router's own PATH
-# (the exec tool offers it).
+# with the image's jsonfilter when that works. OpenWrt builds busybox without
+# "busybox --list", so the applet names come from the image's own links to it in
+# bin, sbin, usr/bin and usr/sbin (relative or absolute targets); --list is a fallback
+# where it works. The links are made with the image's own ln (the overlay's may be
+# replaced too). MCP_PATH_ORIG keeps the router's own PATH (the exec tool offers it).
 # shellcheck disable=SC2034  # used by server/90-exec.sh
 MCP_PATH_ORIG=$PATH
 MCP_TRUSTED=no
-_mcp_ln() { "$MCP_ROM/bin/busybox" ln -s "$1" "$2" 2>/dev/null || ln -s "$1" "$2" 2>/dev/null; }
-if [ -x "$MCP_ROM/bin/busybox" ] && "$MCP_ROM/bin/busybox" true 2>/dev/null; then
+_mcp_bb=$MCP_ROM/bin/busybox
+_mcp_ln() { $_mcp_lncmd -s "$1" "$2" 2>/dev/null; }
+if [ -x "$_mcp_bb" ] && "$_mcp_bb" true 2>/dev/null; then
 	mkdir "$MCP_TMP/bin"
-	for _a in $("$MCP_ROM/bin/busybox" --list 2>/dev/null); do
-		case $_a in */* | . | ..) continue ;; esac
-		_mcp_ln "$MCP_ROM/bin/busybox" "$MCP_TMP/bin/$_a"
+	_mcp_lncmd="$_mcp_bb ln"
+	case $_mcp_bb in *[!A-Za-z0-9_./-]*) _mcp_lncmd='ln' ;; esac
+	$_mcp_lncmd -s "$_mcp_bb" "$MCP_TMP/bin/.probe" 2>/dev/null || _mcp_lncmd='ln'
+	rm -f "$MCP_TMP/bin/.probe"
+	# "R <rom path of a link>" for relative links (ln -s with many sources makes all of
+	# them in one go, each resolving through the image's link), "A <name>" for absolute
+	for _d in bin sbin usr/bin usr/sbin; do
+		[ -d "$MCP_ROM/$_d" ] || continue
+		echo "D /$_d"
+		# shellcheck disable=SC2012
+		ls -l "$MCP_ROM/$_d" 2>/dev/null
+	done | awk -v rom="${MCP_ROM%/}" '
+	function norm(p,   n, i, part, out, k, st) {
+		n = split(p, part, "/"); k = 0
+		for (i = 1; i <= n; i++) {
+			if (part[i] == "" || part[i] == ".") continue
+			if (part[i] == "..") { if (k > 0) k--; continue }
+			st[++k] = part[i]
+		}
+		out = ""
+		for (i = 1; i <= k; i++) out = out "/" st[i]
+		return out
+	}
+	$1 == "D" { d = $2; next }
+	/^l/ && $(NF - 1) == "->" {
+		name = $(NF - 2); t = $NF
+		if (name ~ /\// || name == "busybox") next
+		if (substr(t, 1, 1) == "/") { if (norm(t) == "/bin/busybox") print "A " name }
+		else if (norm(d "/" t) == "/bin/busybox") print "R " rom d "/" name
+	}' >"$MCP_TMP/applets"
+	# shellcheck disable=SC2016  # the inner script expands its own arguments
+	sed -n 's/^R //p' "$MCP_TMP/applets" |
+		xargs sh -c 'l=$1 d=$2; shift 2; $l -s "$@" "$d" 2>/dev/null' sh "$_mcp_lncmd" "$MCP_TMP/bin"
+	for _a in $(sed -n 's/^A //p' "$MCP_TMP/applets") $("$_mcp_bb" --list 2>/dev/null); do
+		case $_a in */* | . | .. | busybox) continue ;; esac
+		[ -e "$MCP_TMP/bin/$_a" ] || [ -L "$MCP_TMP/bin/$_a" ] || _mcp_ln "$_mcp_bb" "$MCP_TMP/bin/$_a"
 	done
-	MCP_TRUSTED="yes ($MCP_ROM/bin/busybox"
-	if [ -x "$MCP_ROM/usr/bin/jsonfilter" ] &&
-		[ "$("$MCP_ROM/usr/bin/jsonfilter" -s '{"a":7}' -e @.a 2>/dev/null)" = 7 ]; then
-		_mcp_ln "$MCP_ROM/usr/bin/jsonfilter" "$MCP_TMP/bin/jsonfilter"
-		MCP_TRUSTED="$MCP_TRUSTED, $MCP_ROM/usr/bin/jsonfilter"
+	rm -f "$MCP_TMP/applets"
+	# shellcheck disable=SC2012
+	_mcp_napplets=$(ls "$MCP_TMP/bin" | wc -l)
+	if [ "$_mcp_napplets" -gt 0 ]; then
+		MCP_TRUSTED="yes ($_mcp_bb, $_mcp_napplets applets"
+		if [ -x "$MCP_ROM/usr/bin/jsonfilter" ] &&
+			[ "$("$MCP_ROM/usr/bin/jsonfilter" -s '{"a":7}' -e @.a 2>/dev/null)" = 7 ]; then
+			_mcp_ln "$MCP_ROM/usr/bin/jsonfilter" "$MCP_TMP/bin/jsonfilter"
+			MCP_TRUSTED="$MCP_TRUSTED; $MCP_ROM/usr/bin/jsonfilter"
+		fi
+		MCP_TRUSTED="$MCP_TRUSTED)"
+		PATH="$MCP_TMP/bin:$PATH"
+	else
+		MCP_TRUSTED="no ($_mcp_bb runs, but no applet links to it were found in the image)"
 	fi
-	MCP_TRUSTED="$MCP_TRUSTED)"
-	PATH="$MCP_TMP/bin:$PATH"
 fi
 export PATH
 
 # ---------------------------------------------------------------- JSON output
-# _mcp_json_text CUT NOTE EMPTY: stdin bytes -> one JSON string literal.
+# _mcp_json_text CUT NOTE EMPTY [LIMIT CUTNOTE]: stdin bytes -> one JSON string literal.
 # Valid UTF-8 passes through; every invalid byte sequence becomes U+FFFD (one per
 # maximal invalid subpart); NUL bytes are dropped; other control characters and DEL
 # are escaped. One trailing newline is dropped. CUT=1: the input was cut at a byte
 # limit, so an incomplete sequence at the very end is dropped instead of replaced.
 # NOTE: plain ASCII (no quote, no backslash) appended on a line of its own. EMPTY: the
-# text used when the input has nothing but newlines and NULs.
+# text used when the input has nothing but newlines and NULs. LIMIT: stop once the
+# escaped text reaches LIMIT bytes (it ends on a whole character or escape, at most 9
+# bytes over) and append CUTNOTE (unless NOTE is CUTNOTE already).
 # awk gets numbers from hexdump, not bytes: busybox awk strings end at NUL, its substr
 # is O(length) (quadratic on long binary lines), and its gsub replacement escapes
 # differ between 1.33 and 1.37.
 _mcp_json_text() {
 	if ! have hexdump; then
 		# fallback without hexdump: every byte outside ASCII becomes "?"
-		tr -d '\000' | tr '\200-\377' '?' | awk -v note="$2" -v empty="$3" '
+		tr -d '\000' | tr '\200-\377' '?' | awk -v note="$2" -v empty="$3" -v lim="${4:-0}" -v cutnote="${5-}" '
+		function escl(s,   o) {
+			o = ""
+			while (match(s, /[\\"\001-\037\177]/)) {
+				o = o substr(s, 1, RSTART - 1) esc[substr(s, RSTART, 1)]
+				s = substr(s, RSTART + 1)
+			}
+			return o s
+		}
 		BEGIN {
 			for (i = 1; i < 32; i++) esc[sprintf("%c", i)] = sprintf("\\u%04x", i)
 			esc[sprintf("%c", 127)] = "\\u007f"
@@ -154,62 +211,69 @@ _mcp_json_text() {
 			printf "\""
 		}
 		{
-			if (NR > 1) printf "\\n"
-			s = $0; o = ""
-			if (s != "") any = 1
-			while (match(s, /[\\"\001-\037\177]/)) {
-				o = o substr(s, 1, RSTART - 1) esc[substr(s, RSTART, 1)]
-				s = substr(s, RSTART + 1)
-			}
-			printf "%s%s", o, s
+			if ($0 != "") any = 1
+			o = ((NR > 1) ? "\\n" : "") escl($0)
+			# over the limit: cut the raw line by the worst case (6 bytes per byte)
+			if (lim && w + length(o) > lim) { o = ((NR > 1) ? "\\n" : "") escl(substr($0, 1, int((lim - w) / 6))); stopped = 1 }
+			w += length(o)
+			printf "%s", o
+			if (stopped) exit
 		}
 		END {
 			if (!any && empty != "") printf "%s", empty
+			if (stopped && cutnote != "" && note != cutnote) printf "\\n%s", cutnote
 			if (note != "") printf "\\n%s", note
 			printf "\""
 		}'
 		return
 	fi
-	hexdump -v -e '32/1 "%u " "\n"' | awk -v cut="$1" -v note="$2" -v empty="$3" '
+	hexdump -v -e '32/1 "%u " "\n"' | awk -v cut="$1" -v note="$2" -v empty="$3" -v lim="${4:-0}" -v cutnote="${5-}" '
 	BEGIN {
 		for (i = 1; i < 256; i++) chr[i] = sprintf("%c", i)
 		for (i = 1; i < 32; i++) esc[i] = sprintf("\\u%04x", i)
 		for (i = 32; i < 127; i++) esc[i] = chr[i]
 		esc[9] = "\\t"; esc[13] = "\\r"; esc[127] = "\\u007f"
 		esc[34] = "\\\""; esc[92] = "\\\\"
+		for (i = 1; i < 128; i++) elen[i] = length(esc[i])
 		bad = chr[239] chr[191] chr[189]
-		need = 0; nl = 0; any = 0; seq = ""
+		need = 0; nl = 0; any = 0; seq = ""; w = 0
 		printf "\""
 	}
 	{
 		o = ""
 		for (i = 1; i <= NF; i++) {
+			if (lim && w >= lim) { stopped = 1; break }
 			b = $i + 0
 			if (need) {
 				if (b >= lo && b <= hi) {
 					seq = seq chr[b]; lo = 128; hi = 191
-					if (--need == 0) { o = o seq; seq = "" }
+					if (--need == 0) { o = o seq; w += length(seq); seq = "" }
 					continue
 				}
-				o = o bad; need = 0; seq = ""
+				o = o bad; w += 3; need = 0; seq = ""
 			}
 			if (b == 10) { nl++; continue }
 			if (b == 0) continue
-			for (; nl > 0; nl--) o = o "\\n"
+			for (; nl > 0; nl--) { o = o "\\n"; w += 2; if (lim && w >= lim) break }
+			if (nl) { stopped = 1; break }
 			any = 1
-			if (b < 128) { o = o esc[b]; continue }
+			if (b < 128) { o = o esc[b]; w += elen[b]; continue }
 			if (b >= 194 && b <= 223) { need = 1; lo = 128; hi = 191 }
 			else if (b >= 224 && b <= 239) { need = 2; lo = (b == 224) ? 160 : 128; hi = (b == 237) ? 159 : 191 }
 			else if (b >= 240 && b <= 244) { need = 3; lo = (b == 240) ? 144 : 128; hi = (b == 244) ? 143 : 191 }
-			else { o = o bad; continue }
+			else { o = o bad; w += 3; continue }
 			seq = chr[b]
 		}
 		printf "%s", o
+		if (stopped) exit
 	}
 	END {
-		if (need && !cut) printf "%s", bad
-		if (any) for (; nl > 1; nl--) printf "\\n"
-		else if (empty != "") printf "%s", empty
+		if (!stopped) {
+			if (need && !cut) printf "%s", bad
+			if (any) for (; nl > 1; nl--) printf "\\n"
+		}
+		if (!any && empty != "") printf "%s", empty
+		if (stopped && cutnote != "" && note != cutnote) printf "\\n%s", cutnote
 		if (note != "") printf "\\n%s", note
 		printf "\""
 	}'
@@ -345,9 +409,25 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 rd() {
 	[ -f "$1" ] || return 1
+	# the whole path is resolved: a link anywhere in it (also a directory link, as in
+	# /tmp/x/kmsg with /tmp/x -> /proc) must not lead into /proc, /sys or /dev unless
+	# the path names that tree itself; after resolving it must still be a regular file
+	if _t=$(readlink -f "$1" 2>/dev/null) && [ -n "$_t" ]; then
+		[ -f "$_t" ] || return 1
+		case $1 in /*) _l=$1 ;; *) _l=$PWD/$1 ;; esac
+		case $_t in
+		/proc/kmsg | */trace_pipe | */trace_pipe_raw) return 1 ;;
+		/proc/*) case $_l in /proc/*) ;; *) return 1 ;; esac ;;
+		/sys/*) case $_l in /sys/*) ;; *) return 1 ;; esac ;;
+		/dev/*) case $_l in /dev/*) ;; *) return 1 ;; esac ;;
+		esac
+		cat "$_t" 2>/dev/null
+		return
+	fi
+	# no readlink -f: only the last component can be checked
 	case $1 in /proc/kmsg | */trace_pipe | */trace_pipe_raw) return 1 ;; esac
 	if [ -L "$1" ]; then
-		_t=$(readlink -f "$1" 2>/dev/null) || _t=$(readlink "$1" 2>/dev/null)
+		_t=$(readlink "$1" 2>/dev/null)
 		case $_t in '' | /proc/* | /sys/* | /dev/*) return 1 ;; esac
 	fi
 	cat "$1" 2>/dev/null
@@ -357,12 +437,48 @@ rom_path() { printf '%s/%s' "${MCP_ROM%/}" "${1#/}"; }
 
 in_rom() { [ -e "$(rom_path "$1")" ] || [ -L "$(rom_path "$1")" ]; }
 
-# Masks secrets in uci show output, config files, shadow lines, key blocks, hostapd and
-# wpa_supplicant files and pretty-printed JSON (ubus call output).
+# Masks secrets, line by line. Names count as secret when they contain password,
+# passwd, passphrase, secret, token, credential, psk, privatekey, presharedkey or pwd, or
+# have a word part pass, pin, pin<N>, pincode, community, keys, r0kh, r1kh or one ending
+# in key (key, key1, apikey, private_key); public_key, pubkey, keyid, key_mgmt and
+# *PasswordAuth stay readable. Formats: uci show (pkg.section.option=value), config
+# files (option/list name value), shadow lines (any hash, also behind ! or *, DES),
+# PEM private key blocks, WireGuard PrivateKey/PresharedKey =, hostapd r0kh=/r1kh=
+# (last field) and per-station PSK files (... MAC PSK), name=value lines (hostapd,
+# wpa_supplicant, shell, env; not when the value is a shell expansion), pretty-printed
+# JSON members, and command lines: --name=value / --name value for secret names, and
+# on lines that run something from a bin directory also pppd style "password value".
+# A value that starts with $ (a shell variable) is never masked in name=value lines and
+# command lines: it is not the secret, and scripts stay readable.
 redact() {
 	if [ "$MCP_REDACT" != 1 ]; then cat; return; fi
 	awk '
-	BEGIN { secret = "(key|key[1-4]|password|passwd|pass|psk|secret|private_key|privatekey|preshared_key|presharedkey|token|auth_secret|sae_password|wpa_passphrase|passphrase|pin|community)" }
+	function issecret(n,   k, i, part) {
+		n = tolower(n); gsub(/["'"'"']/, "", n)
+		if (n ~ /^(.*[_-])?(pub|public)_?key$|^(.*[_-])?key_?(mgmt|id|index|type|len|length|size|format)$|password_?auth$/) return 0
+		if (n ~ /password|passwd|passphrase|secret|token|credential|psk|privatekey|presharedkey|pwd/) return 1
+		k = split(n, part, /[^a-z0-9]+/)
+		for (i = 1; i <= k; i++)
+			if (part[i] ~ /^(pass|pin|pin[0-9]+|pincode|community|keys|r[01]kh)$/ || part[i] ~ /key[0-9]*$/) return 1
+		return 0
+	}
+	function isexp(v) { return v ~ /^["'"'"']?[$`]/ }
+	function cmdl(s,   out, pre, t, mask, isbin, name, v) {
+		isbin = (s ~ /(^|[ \t])(\/usr)?\/s?bin\//)
+		out = ""; mask = 0
+		while (match(s, /[^ \t]+/)) {
+			pre = substr(s, 1, RSTART - 1); t = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+			if (mask) { if (!isexp(t)) t = "<redacted>"; mask = 0 }
+			else if (t ~ /^--?[A-Za-z][A-Za-z0-9_-]*=/) {
+				name = substr(t, 1, index(t, "=") - 1); sub(/^--?/, "", name); v = substr(t, index(t, "=") + 1)
+				if (issecret(name) && v != "" && !isexp(v)) t = substr(t, 1, index(t, "=")) "<redacted>"
+			}
+			else if (t ~ /^--?[A-Za-z][A-Za-z0-9_-]*$/) { name = t; sub(/^--?/, "", name); if (length(name) > 1 && issecret(name)) mask = 1 }
+			else if (isbin && tolower(t) ~ /^(password|passwd|pass|secret|psk|key|pwd|token)$/) mask = 1
+			out = out pre t
+		}
+		return out s
+	}
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { print; inkey = 1; next }
 	inkey && /-----END [A-Z ]*PRIVATE KEY-----/ { print "<redacted>"; print; inkey = 0; next }
 	inkey { next }
@@ -371,31 +487,49 @@ redact() {
 		# uci show:  pkg.section.option=value
 		if (match(line, /^[^=. ]+\.[^=. ]+\.[^= ]+=/)) {
 			opt = substr(line, 1, RLENGTH - 1); sub(/^.*\./, "", opt)
-			if (tolower(opt) ~ ("^" secret "$|_" secret "$")) { print substr(line, 1, RLENGTH) "'"'"'<redacted>'"'"'"; next }
+			if (issecret(opt)) print substr(line, 1, RLENGTH) "'"'"'<redacted>'"'"'"
+			else print line
+			next
 		}
 		# config file:  option name value / list name value
 		if (match(line, /^[ \t]*(option|list)[ \t]+[^ \t]+[ \t]+/)) {
 			n = split(line, f, /[ \t]+/); opt = (f[1] == "") ? f[3] : f[2]
-			gsub(/["'"'"']/, "", opt)
-			if (tolower(opt) ~ ("^" secret "$|_" secret "$")) { print substr(line, 1, RLENGTH) "'"'"'<redacted>'"'"'"; next }
+			if (issecret(opt)) print substr(line, 1, RLENGTH) "'"'"'<redacted>'"'"'"
+			else print line
+			next
 		}
-		# shadow:  name:hash:...
-		if (match(line, /^[^:]+:\$[^:]+:/)) {
-			split(line, f, ":"); rest = substr(line, length(f[1]) + length(f[2]) + 2)
-			alg = f[2]; sub(/^\$/, "", alg); sub(/\$.*/, "", alg)
-			print f[1] ":<redacted hash, $" alg ">" rest; next
+		# shadow:  name:hash:lastchg:min:max:warn:inactive:expire:reserved, the hash
+		# maybe behind ! or * (locked); a bare ! or * holds no hash
+		if (split(line, f, ":") == 9 && f[1] ~ /^[A-Za-z0-9_.][A-Za-z0-9_.-]*[$]?$/ && f[3] ~ /^[0-9]*$/ && f[4] ~ /^[0-9]*$/) {
+			h = f[2]; pre = ""
+			if (match(h, /^[!*]+/)) { pre = substr(h, 1, RLENGTH); h = substr(h, RLENGTH + 1) }
+			d = ""
+			if (h ~ /^[$][^$]+[$]/) { d = h; sub(/^[$]/, "", d); sub(/[$].*/, "", d); d = "$" d }
+			else if (h ~ /^[.\/0-9A-Za-z]+$/ && length(h) == 13) d = "DES"
+			else if (h != "" && h != "x") d = "unknown format"
+			if (d != "") {
+				print f[1] ":" pre "<redacted hash, " d ">" substr(line, length(f[1]) + length(f[2]) + 2); next
+			}
 		}
-		# wireguard / generic:  PrivateKey = ...
+		# wireguard:  PrivateKey = ... / PresharedKey = ...
 		if (tolower(line) ~ /^[ \t]*(privatekey|presharedkey)[ \t]*=/) { sub(/=.*/, "= <redacted>", line); print line; next }
-		# hostapd / wpa_supplicant:  wpa_passphrase=..., psk="...", sae_password=...
-		if (match(line, /^[ \t]*(wpa_passphrase|wpa_psk|sae_password|psk|password|private_key_passwd)=/)) { print substr(line, 1, RLENGTH) "<redacted>"; next }
+		# hostapd r0kh= / r1kh=: MAC, id, key; the last field is the key
+		if (line ~ /^[ \t]*r[01]kh=[^ \t]*[ \t]+[^ \t]/) { sub(/[^ \t]+[ \t]*$/, "<redacted>", line); print line; next }
+		# hostapd per-station PSK file:  [keyid=..] [vlanid=..] [wps=1] MAC PSK
+		if (match(line, /^[ \t]*([A-Za-z_]+=[^ \t]*[ \t]+)*[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f][ \t]+/) &&
+			substr(line, RLENGTH + 1) ~ /^[^ \t]+[ \t]*$/) { print substr(line, 1, RLENGTH) "<redacted>"; next }
+		# name=value (hostapd, wpa_supplicant, shell, environment)
+		if (match(line, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/)) {
+			opt = substr(line, 1, RLENGTH - 1); sub(/^[ \t]*(export[ \t]+)?/, "", opt); v = substr(line, RLENGTH + 1)
+			if (issecret(opt) && v != "" && !isexp(v)) { print substr(line, 1, RLENGTH) "<redacted>"; next }
+		}
 		# pretty-printed JSON (ubus call ...):  "key": "value"
 		if (match(line, /^[ \t]*"[A-Za-z0-9_]+"[ \t]*:[ \t]*"/)) {
 			opt = substr(line, 1, RLENGTH); sub(/^[ \t]*"/, "", opt); sub(/".*/, "", opt)
-			if (tolower(opt) ~ ("^" secret "$|_" secret "$")) {
-				print substr(line, 1, RLENGTH - 1) "\"<redacted>\"" (line ~ /,[ \t]*$/ ? "," : ""); next
-			}
+			if (issecret(opt)) { print substr(line, 1, RLENGTH - 1) "\"<redacted>\"" (line ~ /,[ \t]*$/ ? "," : ""); next }
 		}
+		# command lines
+		if (line ~ /(^|[ \t])--?[A-Za-z]/ || line ~ /(^|[ \t])(\/usr)?\/s?bin\//) line = cmdl(line)
 		print line
 	}'
 }
@@ -550,11 +684,16 @@ _mcp_tools_list() { # ID
 	} >&3
 }
 
-# _mcp_result ID ISERROR CUT NOTE: the tool result, text from $MCP_TMP/out
+# _mcp_result ID ISERROR CUT NOTE: the tool result, text from $MCP_TMP/out. The text
+# is cut where its escaped form reaches MCP_MAX_OUTPUT bytes (control characters take 6,
+# invalid bytes 3), so the result line stays near the limit whatever the tool printed.
 _mcp_result() {
+	_rs_cut="[output cut at $MCP_MAX_OUTPUT bytes of text (control characters and invalid bytes take more room escaped); narrow the request or page with offset/limit where the tool has them]"
+	case $4 in "[output cut"*) _rs_cut=$4 ;; esac
 	{
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":' "$1"
-		head -c "$MCP_MAX_OUTPUT" "$MCP_TMP/out" 2>/dev/null | _mcp_json_text "$3" "$4" "(no output)"
+		head -c "$MCP_MAX_OUTPUT" "$MCP_TMP/out" 2>/dev/null |
+			_mcp_json_text "$3" "$4" "(no output)" "$MCP_MAX_OUTPUT" "$_rs_cut"
 		printf '}],"isError":%s}}\n' "$2"
 	} >&3
 }
@@ -593,6 +732,9 @@ _mcp_tools_call() { # ID
 		_mcp_tag=''
 		return
 	fi
+	# every call starts in an empty work directory
+	rm -rf "$MCP_TMP/work"
+	mkdir "$MCP_TMP/work"
 	# producer: the handler, writing into the FIFO
 	(
 		MCP_CALL_TAG=$_mcp_tag
@@ -601,14 +743,17 @@ _mcp_tools_call() { # ID
 		"tool_$_name"
 	) </dev/null >"$_ct_fifo" 2>&1 3>&- &
 	_mcp_P=$!
-	# reader: keeps at most MCP_MAX_OUTPUT+1 bytes, then stops the producer
+	# reader: keeps at least MCP_MAX_OUTPUT+1 bytes (rounded up to 512-byte blocks by the
+	# file size limit), then stops the producer. cat writes what it reads at once, so
+	# nothing read is lost when the reader is killed (head -c buffers).
 	(
-		head -c $((MCP_MAX_OUTPUT + 1)) >"$_out"
+		ulimit -f $(((MCP_MAX_OUTPUT + 512) / 512))
+		cat >"$_out"
 		if [ "$(wc -c <"$_out")" -gt "$MCP_MAX_OUTPUT" ]; then
 			: >"$MCP_TMP/cut"
 			_mcp_kill_tree "$_mcp_P" "$_mcp_tag"
 		fi
-	) <"$_ct_fifo" 3>&- &
+	) <"$_ct_fifo" 2>/dev/null 3>&- &
 	_mcp_R=$!
 	_mcp_alarm "$_mcp_P" "$_ct_to" _mcp_kill_tree "$_mcp_P" "$_mcp_tag"
 	_mcp_W=$_mcp_alarm_pid
@@ -641,7 +786,7 @@ _mcp_tools_call() { # ID
 		_err=false
 		_note="[output cut at $MCP_MAX_OUTPUT bytes and the tool was stopped; narrow the request or page with offset/limit where the tool has them]"
 	elif [ "$_ct_held" = 1 ]; then
-		_note="[a background process started by this call still holds its output open; what it prints after the call ended is not shown (redirect it: cmd >/dev/null 2>&1 &)]"
+		_note="[a background process started by this call still holds its output open 2 s after the call ended; it keeps running, and what it prints from now on is not shown (redirect it: cmd >/dev/null 2>&1 &)]"
 	fi
 	_mcp_result "$1" "$_err" "$_cut" "$_note"
 	_mcp_tag=
@@ -659,10 +804,18 @@ _mcp_handle() {
 	array) _mcp_error null -32600 "Invalid Request: batches are not supported"; return ;;
 	*) _mcp_error null -32600 "Invalid Request: expected a JSON object"; return ;;
 	esac
+	# numeric ids: integers of up to 15 digits only, echoed as jsonfilter read them;
+	# jsonfilter reformats fractions and exponents (1e999 -> inf) and clamps big
+	# integers to int64, so such an id could not be echoed as sent
 	case $_it in
-	int | double) _id=$_i ;;
+	int)
+		case ${_i#-} in
+		'' | *[!0-9]* | ????????????????*) _mcp_error null -32600 "Invalid Request: a numeric id must be an integer of at most 15 digits"; return ;;
+		esac
+		_id=$_i ;;
 	string) _id=$(json_quote "$_i") ;;
 	'') _id= ;;
+	double) _mcp_error null -32600 "Invalid Request: a numeric id must be an integer of at most 15 digits"; return ;;
 	*) _mcp_error null -32600 "Invalid Request: id must be a string or an integer"; return ;;
 	esac
 	mcp_log "<- ${_method:-?} id=${_id:-none}"

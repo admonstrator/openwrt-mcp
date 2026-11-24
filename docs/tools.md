@@ -19,7 +19,9 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
 - `initialize` answers with the client's `protocolVersion` when the server knows it
   (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05), otherwise with the newest.
 - Errors: `-32700` the line is not JSON (id null); `-32600` a batch (array), a non-object,
-  an id that is not a string or a number (also `null`; id null), no or non-string `method`,
+  an id that is not a string or an integer of at most 15 digits (also `null`, fractions,
+  exponents and bigger integers, which could not be echoed exactly; id null), no or
+  non-string `method`,
   `jsonrpc` not `"2.0"`; `-32601` unknown method; `-32602` `params` not an object,
   `tools/call` without a string `name`, unknown tool.
 - Notifications (no `id`) never get a reply, whatever the method; `notifications/cancelled`
@@ -39,19 +41,31 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
   `number`, `boolean`, `array`, `object`) and `required`. `null` counts as absent. A
   mismatch is a normal tool result with `isError: true` that names the argument and
   lists what the tool takes. `arg_int` ranges are checked by the handler, same way.
-- **Output cap**: a handler writes into a FIFO; a reader keeps at most `MCP_MAX_OUTPUT`
-  (default 60000) bytes. One byte more and the call's process tree is killed and the
-  text ends with `[output cut at N bytes and the tool was stopped; narrow the request or
-  page with offset/limit where the tool has them]`. `isError` stays false. `/tmp` never
-  holds more than the cap per call, whatever the tool prints.
+- **Work directory**: every handler starts in `$MCP_TMP/work`, which is emptied before
+  every call; scratch files never carry over to the next call.
+- **Output cap**: a handler writes into a FIFO; a reader (`cat` under a file size limit,
+  so what it has read is on disk even when it is killed) keeps `MCP_MAX_OUTPUT` (default
+  60000) bytes plus at most one 512-byte block. More than the cap and the call's process
+  tree is killed and the text ends with `[output cut at N bytes and the tool was
+  stopped; narrow the request or page with offset/limit where the tool has them]`.
+  `isError` stays false. `/tmp` never holds more than the cap per call, whatever the
+  tool prints.
+- **Text cap**: the cap also holds for the text as sent: escaped, a control character
+  takes 6 bytes (`\u0001`), an invalid byte 3 (U+FFFD), a newline, quote, backslash or
+  tab 2. The text stops where its escaped form reaches `MCP_MAX_OUTPUT` bytes (on a
+  whole character, at most 9 bytes over) and ends with `[output cut at N bytes of text
+  (control characters and invalid bytes take more room escaped); ...]`, so a result line
+  is never much longer than the cap.
 - **Call timeout**: `MCP_CALL_TIMEOUT` (default 120 s) per call; for `exec` the limit is
   at least its `timeout` + 5 s. On timeout the call's process tree and every process
   that carries the call's `MCP_CALL_TAG` environment variable (children that daemonized
   and left the tree) are killed; the text ends with `[timeout: the call was stopped after
   N s ...]` and `isError` is true. The server keeps serving.
 - **Background holders**: a process the call started in the background that keeps the
-  output open does not block the reply: 2 s after the handler ends the reader stops and
-  the text ends with a note saying so. The process itself keeps running.
+  output open does not block the reply: 2 s after the handler ends the reader stops; the
+  text has everything printed until then and ends with `[a background process started
+  by this call still holds its output open 2 s after the call ended; it keeps running,
+  and what it prints from now on is not shown ...]`.
 - **Text encoding**: every result is valid UTF-8 and the JSON line is valid JSON,
   whatever the tool printed. Invalid UTF-8 becomes U+FFFD (one per maximal invalid
   subpart, like Python's `errors="replace"`), NUL bytes are dropped, control characters
@@ -74,16 +88,40 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
   signal timing; a cancelled watchdog is frozen and killed together with its `sleep`.
 - `json_quote STRING` keeps a trailing newline of STRING (before, it was dropped);
   `json_str` still drops one trailing newline of its input.
-- `rd` also refuses `/proc/kmsg` and `trace_pipe` files (regular files that block).
-- `redact` also masks hostapd/wpa_supplicant lines (`wpa_passphrase=`, `wpa_psk=`,
-  `sae_password=`, `psk=`, `password=`, `private_key_passwd=`) and pretty-printed JSON
-  members such as `"key": "..."` (ubus output).
+- `rd` resolves the whole path (`readlink -f`): a link anywhere in it, also a directory
+  link such as `/tmp/x -> /proc` in `/tmp/x/kmsg`, must not lead into `/proc`, `/sys` or
+  `/dev` unless the path itself starts there (`rd /proc/cpuinfo` works), and the
+  resolved file must be a regular file. `/proc/kmsg` and `trace_pipe` files (regular
+  files that block) are always refused. Without `readlink -f` only the last component is
+  checked, as before.
+- `redact` masks, line by line:
+  - names that contain `password`, `passwd`, `passphrase`, `secret`, `token`,
+    `credential`, `psk`, `privatekey`, `presharedkey` or `pwd`, or have a word part
+    `pass`, `pin`, `pin<N>`, `pincode`, `community`, `keys`, `r0kh`, `r1kh` or one ending
+    in `key` (`key`, `key1`, `apikey`, `private_key`); `public_key`, `pubkey`, `keyid`,
+    `key_mgmt`, `*PasswordAuth` stay readable. These names count in uci show
+    (`pkg.section.option=value`), config files (`option`/`list`, e.g. acme's
+    `list credentials 'CF_Token=...'`), `name=value` lines (hostapd, wpa_supplicant,
+    shell, `export`; not when the value starts with `$` or a backtick) and pretty-printed
+    JSON members (ubus);
+  - shadow lines with any hash, also behind `!`/`*` (locked) and 13-character DES
+    hashes (`name:<redacted hash, $6>:...`); a bare `!` or `*` is kept;
+  - PEM private key blocks, WireGuard `PrivateKey =`/`PresharedKey =`, hostapd
+    `r0kh=`/`r1kh=` (the last field, the key) and per-station PSK files
+    (`[keyid=..] [vlanid=..] MAC PSK`);
+  - command lines: `--name=value` and `--name value` for the secret names above, and on
+    lines that run something from a bin directory also pppd style `password value`
+    (`password`, `passwd`, `pass`, `secret`, `psk`, `key`, `pwd`, `token`). Single-letter
+    options such as `-p` are left alone (`-p 22` is a port for dropbear and ssh).
+  It decides on the line format only, not on file names: a bare base64 line (a
+  WireGuard `privatekey` file) is not recognised; tools that show whole files decide by
+  the file name.
 
 ### Environment knobs
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MCP_ROM` | `/rom` | firmware image root; when its `bin/busybox` runs, every applet of it (and its `usr/bin/jsonfilter`, when that works) goes first in PATH: `server_info` shows it as trusted tools |
+| `MCP_ROM` | `/rom` | firmware image root; when its `bin/busybox` runs, its applets go first in PATH (and its `usr/bin/jsonfilter`, when that works). The applet names come from the image's links to busybox in `bin`, `sbin`, `usr/bin`, `usr/sbin` (OpenWrt's busybox has no `--list`; it is used where it works). `server_info` shows `yes (/rom/bin/busybox, N applets)`, or `no (...)` when none were found |
 | `MCP_UPPER` | `/overlay/upper` | overlay upper directory |
 | `MCP_REDACT` | `1` | `0` turns masking of secrets off (launcher `--no-redact`) |
 | `MCP_MAX_OUTPUT` | `60000` | bytes per result (launcher `--max-output`) |
@@ -153,7 +191,7 @@ All tools are read-only and take their data from `/proc`, `/sys`, files and the 
 programs `ubus`, `uci`, `logread`, `dmesg`, `ip`, `iwinfo`, `wg`, `nft`, `iptables-save`,
 `opkg`/`apk`. A missing source is reported as "not available" with the reason. Flags that
 compare against the firmware image ("not in firmware image") are only set when `MCP_ROM`
-looks like a firmware root (`lib_rom_ok`: has `etc/` and `bin/` or `usr/`); containers,
+looks like a firmware root (`lib_rom_ok`: has `etc/`, `bin/`, `usr/` or `lib/`); containers,
 ext4 and initramfs images get a note instead of a flag on every file.
 
 | Tool | Arguments (default) | Reads |
@@ -194,12 +232,17 @@ Details and limits:
   (later than 10 minutes after it counts as user-installed, a heuristic); apk cannot tell
   and marks packages named in `/etc/apk/world` as REQ. Changed config files: opkg's
   `Conffiles` hashes are recomputed directly (`opkg list-changed-conffiles` would write a
-  lock file); apk uses `apk audit`. `audit=true` runs `apk audit --system` (package files
+  lock file); a conffile that is not a regular file or links into /proc, /sys or /dev is
+  reported as `unreadable` and never opened. apk uses `apk audit --no-cache` (without
+  `--no-cache` apk creates `/tmp/cache/apk`). `audit=true` runs `apk audit --system` (package files
   whose content changed); opkg has no file hashes and says so.
 - `logs` passes every line through `redact`. `file` must resolve to a file under
   `/tmp/log` or `/var/log`.
 - `kernel_modules` prints the taint and a "Flagged" section first, then the module
-  list and the boot lists. It flags a loaded module whose `.ko` under `/lib/modules/<release>` is
+  list and the boot lists. `/proc/modules` lists only loadable modules, so a loaded
+  module without a `.ko` under `/lib/modules/<release>` is flagged (loaded from elsewhere
+  or deleted after loading); when that directory does not exist at all (containers) the
+  check is skipped with a note. It also flags a loaded module whose `.ko` under `/lib/modules/<release>` is
   not in the image, and `/etc/modules.d` entries not in the image. Taint bits are decoded;
   `O` (out-of-tree) is normal on OpenWrt.
 - `uci` never sets or commits. `package` may be `pkg` or `pkg.section[.option]`.
@@ -224,15 +267,25 @@ Details and limits:
 - `firewall` prints what is exposed first (zones, forwardings, WAN-input accepts, port
   forwards, includes), then all rules, UPnP, custom rule files and the active ruleset.
   WAN zones are zones named `*wan*`, masquerading, or holding network
-  `wan`. "Rules accepting input from a WAN zone" are enabled or disabled `rule` sections
+  `wan`. `iptables-save`/`ip6tables-save` run only when `/proc/net/ip_tables_names`
+  (`ip6_tables_names`) lists tables: legacy iptables would otherwise load the table
+  modules. "Rules accepting input from a WAN zone" are enabled or disabled `rule` sections
   with a WAN `src`, no `dest` and target ACCEPT. The ruleset is capped at 300 lines per
   command unless `raw=true`.
 
 Helpers in `server/05-lib.sh` (for other modules): `lib_sockets` (unchanged format),
 `lib_procs` (TSV: pid ppid uid state rss_kb start kthread comm exe cmdline),
-`lib_fd_inodes` ("inode pid"), `lib_uci_dump PKG` (TSV `S sec type` / `O sec opt value`,
+`lib_fd_inodes` ("inode pid"); control characters in comm and cmdline are replaced
+(`?` in comm, space in cmdline), so a name with a newline cannot split a record, `lib_uci_dump PKG` (TSV `S sec type` / `O sec opt value`,
 not redacted), `lib_ubus OBJ METHOD` (only when the ubus socket exists, 10 s limit;
-redirect its output to a file), `lib_rom_ok`, `lib_upper`.
+redirect its output to a file), `lib_rom_ok`, `lib_upper` (MCP_UPPER when it exists;
+with the default MCP_UPPER also the upperdir of an overlay root mount, then
+`/userdata/overlay/upper`; prints nothing and fails when there is none).
+
+Command lines (process list and `pid` view, procd instances, daemon lines in `network`)
+pass through `redact`; the `pid` view also masks the argument after `password`,
+`secret`, `psk`, `key`, `token` style arguments and the value of `--password=...`
+style arguments itself.
 
 ## 4 Files, forensics and audit
 

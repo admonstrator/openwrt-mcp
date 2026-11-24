@@ -82,34 +82,71 @@ class TestExec(OpenWrtTestCase):
         # the server keeps serving
         self.assertIn("[exit 0]", self.run_exec(command="true")[0])
 
+    # A firmware image like OpenWrt's: busybox without the "busybox" applet (so no
+    # --list), reached through relative links in bin, sbin, usr/bin and usr/sbin. The
+    # containers' own /bin/busybox and links have exactly that shape; copy them.
+    OPENWRT_ROM = r"""rm -rf /fixture/owrt && for d in bin sbin usr/bin usr/sbin; do mkdir -p /fixture/owrt/$d; done
+        cp /bin/busybox /fixture/owrt/bin/
+        for f in $(find /bin /sbin /usr/bin /usr/sbin -type l); do
+            [ "$(readlink -f "$f")" = /bin/busybox ] && cp -a "$f" "/fixture/owrt$f"
+        done
+        /fixture/owrt/bin/busybox --list | wc -l; find /fixture/owrt -type l | wc -l"""
+
     @needs_container
-    def test_trusted_tools(self):
+    def test_trusted_tools_openwrt_image(self):
+        listed, links = (int(x) for x in self.sh(self.OPENWRT_ROM).split())
+        self.assertEqual(listed, 0, "the fixture busybox must not answer --list, like OpenWrt's")
+        self.assertGreater(links, 50)
+        env = {"MCP_ROM": "/fixture/owrt"}
+        info, _ = self.session(env).call_tool("server_info")
+        self.assertIn(f"trusted tools yes (/fixture/owrt/bin/busybox, {links} applets)", info)
+        # the image's links win, and they run the image's busybox
+        text, _ = self.run_exec(env, command="for c in ls sleep head ifconfig; do command -v $c; done;"
+                                             " readlink -f $(command -v ls); ls /fixture >/dev/null && echo ok")
+        lines = text.splitlines()
+        for line in lines[:4]:
+            self.assertRegex(line, r"^/tmp/openwrt-mcp\.[^/]+/bin/(ls|sleep|head|ifconfig)$")
+        self.assertEqual(lines[4], "/fixture/owrt/bin/busybox")
+        self.assertEqual(lines[5], "ok")
+        # trusted_tools=false: the router's own PATH
+        text, _ = self.run_exec(env, command="command -v ls", trusted_tools=False)
+        self.assertTrue(text.startswith("/bin/ls\n"), text)
+
+        # the image's jsonfilter is used too when it works
+        self.sh("mkdir -p /fixture/owrt/usr/bin && cp /usr/bin/jsonfilter /fixture/owrt/usr/bin/")
+        env2 = {"MCP_ROM": "/fixture/owrt", "MCP_DEBUG": "0"}
+        info, _ = self.session(env2).call_tool("server_info")
+        self.assertIn(f"trusted tools yes (/fixture/owrt/bin/busybox, {links} applets;"
+                      " /fixture/owrt/usr/bin/jsonfilter)", info)
+        text, _ = self.run_exec(env2, command="readlink $(command -v jsonfilter)")
+        self.assertIn("/fixture/owrt/usr/bin/jsonfilter\n", text)
+
+    @needs_container
+    def test_trusted_tools_none_found(self):
+        # a busybox that runs but has neither links nor --list: not "yes"
+        self.sh("rm -rf /fixture/bare && mkdir -p /fixture/bare/bin && cp /bin/busybox /fixture/bare/bin/")
+        env = {"MCP_ROM": "/fixture/bare"}
+        info, _ = self.session(env).call_tool("server_info")
+        self.assertIn("trusted tools no (/fixture/bare/bin/busybox runs, but no applet links", info)
+        text, _ = self.run_exec(env, command="command -v ls")
+        self.assertTrue(text.startswith("/bin/ls\n"), text)
+
+    @needs_container
+    def test_trusted_tools_list_fallback(self):
+        # a busybox that does answer --list (not OpenWrt's) still works
         self.sh("mkdir -p /fixture/rom/bin && cat > /fixture/rom/bin/busybox <<'EOF'\n"
                 f"{FAKE_BUSYBOX}EOF\nchmod 755 /fixture/rom/bin/busybox")
         env = {"MCP_ROM": "/fixture/rom"}
         info, _ = self.session(env).call_tool("server_info")
-        self.assertIn("trusted tools yes (/fixture/rom/bin/busybox)", info)
-
+        self.assertIn("trusted tools yes (/fixture/rom/bin/busybox, 1 applets)", info)
         text, err = self.run_exec(env, command="mcpfake; echo $PATH")
         self.assertIn("fake applet from the firmware image", text)
         self.assertRegex(text, r"\n/tmp/openwrt-mcp\.[^/]+/bin:")
-        self.assertIn("[exit 0]", text)
-
         text, err = self.run_exec(env, command="mcpfake; echo $PATH", trusted_tools=False)
         self.assertNotIn("fake applet", text)
         self.assertIn("not found", text)
         self.assertNotIn("/tmp/openwrt-mcp.", text)
-
-        # the image's jsonfilter is used too when it works
-        self.sh("mkdir -p /fixture/rom2/bin /fixture/rom2/usr/bin && cp /fixture/rom/bin/busybox /fixture/rom2/bin/"
-                " && cp /usr/bin/jsonfilter /fixture/rom2/usr/bin/")
-        env2 = {"MCP_ROM": "/fixture/rom2"}
-        info, _ = self.session(env2).call_tool("server_info")
-        self.assertIn("trusted tools yes (/fixture/rom2/bin/busybox, /fixture/rom2/usr/bin/jsonfilter)", info)
-        text, _ = self.run_exec(env2, command="readlink $(command -v jsonfilter)")
-        self.assertIn("/fixture/rom2/usr/bin/jsonfilter\n", text)
-
-        # without a firmware busybox both settings use the normal PATH
+        # without a firmware busybox the normal PATH
         text, _ = self.run_exec(command="echo $PATH")
         self.assertNotIn("/tmp/openwrt-mcp.", text)
 
