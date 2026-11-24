@@ -2,7 +2,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./images/logo-dark.png">
-  <img src="./images/logo.png" alt="OpenWrt MCP for OpenWrt and GL.iNet routers" width="480">
+  <img src="./images/logo.png" alt="OpenWrt MCP, also for GL.iNet routers" width="480">
 </picture>
 
 <h1>openwrt-mcp</h1>
