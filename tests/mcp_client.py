@@ -67,12 +67,41 @@ class Container:
         )
         self.push_server()
 
-    def push_server(self) -> None:
+    def push_server(self, extra: str = "") -> None:
+        """Copy the server into the container. extra: shell code (test tool modules)
+        inserted before the final mcp_main call."""
+        script = build_server()
+        if extra:
+            head, sep, tail = script.rpartition(b"\nmcp_main\n")
+            assert sep, "server has no final mcp_main line"
+            script = head + b"\n" + extra.encode() + sep + tail
         with tempfile.NamedTemporaryFile(suffix=".sh") as f:
-            f.write(build_server())
+            f.write(script)
             f.flush()
             subprocess.run(["docker", "cp", f.name, f"{self.name}:{REMOTE_SCRIPT}"],
                            check=True, capture_output=True)
+
+    def put(self, path: str, data: bytes) -> None:
+        """Write bytes to a file inside the container."""
+        subprocess.run(["docker", "exec", "-i", self.name, "/bin/sh", "-c", 'cat > "$1"', "sh", path],
+                       input=data, check=True, capture_output=True, timeout=TIMEOUT)
+
+    def procs(self) -> list[tuple[int, int, str, str]]:
+        """Live processes in the container: (pid, ppid, state, cmdline). Zombies are left
+        out: the containers' pid 1 (sleep) never reaps orphans."""
+        out = self.sh(r"""for d in /proc/[0-9]*; do
+            s=$(cat "$d/stat" 2>/dev/null) || continue
+            c=$(tr '\000\n' '  ' < "$d/cmdline" 2>/dev/null)
+            printf '%s|%s|%s\n' "${d#/proc/}" "${s##*) }" "$c"; done""")
+        res = []
+        for line in out.splitlines():
+            pid, _, rest = line.partition("|")
+            stat, _, cmd = rest.partition("|")
+            f = stat.split()
+            if not pid.isdigit() or len(f) < 2 or f[0] == "Z":
+                continue
+            res.append((int(pid), int(f[1]), f[0], cmd))
+        return res
 
     def sh(self, script: str, check: bool = True) -> str:
         """Run a shell script inside the container as root, return stdout."""
@@ -96,9 +125,10 @@ class Container:
 class Session:
     """One running server process. Lines in, lines out."""
 
-    def __init__(self, cmd: list[str]):
+    def __init__(self, cmd: list[str], env: dict[str, str] | None = None):
+        """env: environment of the local process (default: inherited)."""
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE)
+                                     stderr=subprocess.PIPE, env=env)
         self.lines: queue.Queue[bytes | None] = queue.Queue()
         self.stderr = bytearray()
         threading.Thread(target=self._pump, daemon=True).start()
@@ -117,6 +147,13 @@ class Session:
     def send_raw(self, data: bytes) -> None:
         self.proc.stdin.write(data)
         self.proc.stdin.flush()
+
+    def read_raw(self, timeout: float = TIMEOUT) -> bytes:
+        """The next line the server wrote, as bytes."""
+        line = self.lines.get(timeout=timeout)
+        if line is None:
+            raise EOFError(f"server exited; stderr: {self.stderr.decode(errors='replace')}")
+        return line
 
     def read_message(self, timeout: float = TIMEOUT) -> dict:
         line = self.lines.get(timeout=timeout)
