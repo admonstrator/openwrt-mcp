@@ -4,7 +4,9 @@ English | [Deutsch](README.de.md)
 
 An MCP server for OpenWrt routers. It gives Claude (or any other MCP client) tools to
 take a router apart: inventory, network exposure, integrity against the firmware image,
-persistence, accounts, and an audit with findings.
+persistence, accounts, and an audit with findings. In admin mode Claude can also
+configure the router: Wi-Fi, LAN and DHCP, firewall, VPN and, on GL.iNet firmware,
+everything the GL.iNet web interface can do.
 
 ## What it does
 
@@ -19,8 +21,12 @@ over the SSH session. No port is opened and nothing is written to flash.
 
 By default the server only reads. It compares what it finds with the firmware image in
 `/rom`, so it can tell which files, services and programs came with the firmware and
-which were added or changed later. With `--admin` it can also change the configuration
-(see [Admin mode](#admin-mode-configuring-the-router)).
+which were added or changed later.
+
+With `--admin` the server also changes the router. You say "change the Wi-Fi password",
+"give the printer a fixed IP" or "forward port 443 to the NAS", and Claude reads the
+current setting, tells you what it is about to change, and makes the change. See
+[Admin mode](#admin-mode-configuring-the-router).
 
 > [!WARNING]
 > The `exec` tool runs any command as root on the router. Your MCP client asks you before
@@ -38,9 +44,9 @@ which were added or changed later. With `--admin` it can also change the configu
 
 ## Giving Claude access to the router
 
-There are two parts. The MCP server gives Claude the tools. The skill
-`openwrt-router-audit` tells Claude in which order to use them and how to read the
-results. The tools work without the skill; the audits are better with it.
+There are two parts. The MCP server gives Claude the tools. The skills tell Claude how
+to use them: `openwrt-router-audit` for checking a router, `openwrt-router-admin` for
+configuring it. The tools work without the skills; the results are better with them.
 
 ### 1. SSH login with a key
 
@@ -74,7 +80,14 @@ project, not only in the current one:
 claude mcp add --scope user router -- ~/openwrt-mcp/bin/openwrt-mcp root@192.168.1.1
 ```
 
-`claude mcp list` shows whether the connection works.
+To let Claude configure the router as well, add the admin server as a second entry
+(see [Admin mode](#admin-mode-configuring-the-router)):
+
+```sh
+claude mcp add --scope user router-admin -- ~/openwrt-mcp/bin/openwrt-mcp --admin root@192.168.1.1
+```
+
+`claude mcp list` shows whether the connections work.
 
 **Claude Desktop (macOS):** put the printed `mcpServers` entry into
 `~/Library/Application Support/Claude/claude_desktop_config.json` and restart the app.
@@ -87,31 +100,40 @@ Launcher options: `-p PORT`, `-i KEY`, `-o SSH_OPTION`, `--no-redact`,
 `--admin` (write tools, see below), `--build FILE` (write the single-file server, for
 example to run it by hand).
 
-### 3. Add the skill
+### 3. Add the skills
 
-The skill is in [.claude/skills/openwrt-router-audit](.claude/skills/openwrt-router-audit).
+The skills are in [.claude/skills](.claude/skills):
 
-**Claude Code:** if you start `claude` inside the cloned repository, the skill is loaded
-already. To have it in every project, copy it to your personal skills:
+| Skill | For |
+| --- | --- |
+| `openwrt-router-audit` | Checking a router: the order of the tools, how to read the results, the report |
+| `openwrt-router-admin` | Configuring a router: which write tool for what, GL.iNet methods for common tasks, what can cut off your access |
+
+**Claude Code:** if you start `claude` inside the cloned repository, the skills are
+loaded already. To have them in every project, copy them to your personal skills:
 
 ```sh
 mkdir -p ~/.claude/skills
-cp -R ~/openwrt-mcp/.claude/skills/openwrt-router-audit ~/.claude/skills/
+cp -R ~/openwrt-mcp/.claude/skills/openwrt-router-audit ~/openwrt-mcp/.claude/skills/openwrt-router-admin ~/.claude/skills/
 ```
 
-**Claude Desktop:** zip the folder and upload the file in the settings where skills are
-managed (the name of that page has changed between app versions):
+**Claude Desktop:** zip each folder and upload the files in the settings where skills
+are managed (the name of that page has changed between app versions):
 
 ```sh
-cd ~/openwrt-mcp/.claude/skills && zip -r ~/openwrt-router-audit.zip openwrt-router-audit
+cd ~/openwrt-mcp/.claude/skills
+zip -r ~/openwrt-router-audit.zip openwrt-router-audit
+zip -r ~/openwrt-router-admin.zip openwrt-router-admin
 ```
 
-The skill points to `docs/tools.md` for details. Outside the repository Claude does not
-have that file and works from the tool descriptions, which is enough for an audit.
+The audit skill points to `docs/tools.md` for details. Outside the repository Claude
+does not have that file and works from the tool descriptions, which is enough for an
+audit.
 
 ### 4. Ask
 
-*"Audit the router and tell me what to look at first."* Claude asks for permission
+*"Audit the router and tell me what to look at first."* Or, with the admin server:
+*"Turn on the guest Wi-Fi and call it Visitors."* Claude asks for permission
 before each tool call. You can allow the read-only tools permanently; leave `exec` on
 "ask every time".
 
@@ -157,6 +179,26 @@ second server next to the read-only one, so each keeps its own permissions:
 | `glinet_api` | Lists and calls the GL.iNet web API on the router (`ubus call gl-session call`), with a method catalog from [glinet-api](https://github.com/admonstrator/glinet-api) |
 | `uci_change` | uci operations on one package, with dry run, commit and reload |
 | `service_control` | Status, start, stop, restart, reload, enable, disable of an init script |
+
+On GL.iNet firmware 4.x, `glinet_api` reaches the same API the web interface uses. The
+catalog has 52 API objects with 368 methods (written from a GL-E5800 with firmware
+4.8.5; other models have fewer or different ones). What that covers:
+
+| Area | What Claude can set |
+| --- | --- |
+| Wi-Fi | SSID, password, encryption, channel, transmit power, on and off, guest Wi-Fi, Wi-Fi 7 MLO, schedules |
+| LAN and DHCP | Router address, DHCP range and lease time, static leases, guest network, client isolation |
+| DNS | Upstream DNS, DNS over TLS/HTTPS, local host names, AdGuard Home |
+| Firewall | Rules, port forwards, DMZ, access to the router from the WAN |
+| Uplink | WAN port, repeater, cellular modem and SIM, USB tethering, multi-WAN, IPv6, router mode (router, access point, repeater, WDS) |
+| VPN | WireGuard and OpenVPN as client and as server, which devices go through the tunnel, kill switch, Tailscale, ZeroTier, Tor |
+| Clients | List of devices, names, blocking by MAC, speed limits, parental control |
+| Remote access | GoodCloud, remote terminal, DDNS, ports of the web interface and SSH |
+| System | Time zone, LED, display, schedules, packages, firmware update, reboot, factory reset |
+| Sharing | Samba and WebDAV shares, DLNA |
+
+On plain OpenWrt there is no GL.iNet API. `uci_change` and `service_control` cover what
+is in `/etc/config`: `wireless`, `network`, `dhcp`, `firewall` and every other package.
 
 Write calls report what changed in `/etc/config` (not other files such as
 `/etc/hosts`). Calls classed as risky, because they can cut off your access, open the
