@@ -51,6 +51,7 @@
 #   MCP_CALL_TIMEOUT   seconds per tool call      default 120
 #   MCP_SELF_DELETE    1 removes this script file after start (launcher sets it)
 #   MCP_DEBUG          1 logs requests to stderr
+#   MCP_PROC           proc root for the audit's process checks (tests)  default /proc
 #
 # ---------------------------------------------------------------- how a call runs
 # The arguments are checked against the tool's inputSchema first (unknown names, JSON
@@ -361,7 +362,7 @@ in_rom() { [ -e "$(rom_path "$1")" ] || [ -L "$(rom_path "$1")" ]; }
 redact() {
 	if [ "$MCP_REDACT" != 1 ]; then cat; return; fi
 	awk '
-	BEGIN { secret = "(key|password|passwd|pass|psk|secret|private_key|privatekey|preshared_key|presharedkey|token|auth_secret|sae_password|wpa_passphrase|passphrase|pin|community)" }
+	BEGIN { secret = "(key|key[1-4]|password|passwd|pass|psk|secret|private_key|privatekey|preshared_key|presharedkey|token|auth_secret|sae_password|wpa_passphrase|passphrase|pin|community)" }
 	/-----BEGIN [A-Z ]*PRIVATE KEY-----/ { print; inkey = 1; next }
 	inkey && /-----END [A-Z ]*PRIVATE KEY-----/ { print "<redacted>"; print; inkey = 0; next }
 	inkey { next }

@@ -104,7 +104,9 @@ class TestHelpers(OpenWrtTestCase):
             . /tmp/lib.sh
             printf "%s\n" "wireless.default_radio0.key='hunter2'" "wireless.default_radio0.ssid='home'" \
               "	option key 'hunter2'" 'root:$1$abc$def:19000:0:99999:7:::' \
-              "network.wg0.private_key='AAAA'" | redact""")
+              "network.wg0.private_key='AAAA'" "wireless.wep0.key2='wepsecret'" \
+              "	option key1 's:wepsecret'" | redact""")
+        self.assertNotIn("wepsecret", out)
         self.assertNotIn("hunter2", out)
         self.assertNotIn("$abc$def", out)
         self.assertNotIn("AAAA", out)
