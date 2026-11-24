@@ -23,6 +23,9 @@ BOTH = {"MCP_ROM": ROM_DIR, "MCP_UPPER": UPPER_DIR}
 MAKE_ROM = f"""
 mkdir -p {ROM_DIR}
 cp -a /bin /sbin /etc /lib /usr /www {ROM_DIR}/ 2>/dev/null
+# Docker mounts these three with the container's start time; in a real image no file is
+# newer than the build, and the first-boot window hangs on the newest file of /etc
+touch -r /etc/openwrt_release {ROM_DIR}/etc/hosts {ROM_DIR}/etc/resolv.conf {ROM_DIR}/etc/hostname
 test -x {ROM_DIR}/bin/busybox && test -f {ROM_DIR}/etc/passwd
 """
 
@@ -40,8 +43,16 @@ cp -a /etc/banner $U/etc/banner
 printf '#!/bin/sh /etc/rc.common\\n' > $U/etc/init.d/gl_helper && chmod 755 $U/etc/init.d/gl_helper
 ln -s ../init.d/gl_helper $U/etc/rc.d/S99gl_helper
 cp -a /etc/passwd $U/etc/passwd && echo 'toor:x:0:0::/root:/bin/ash' >> $U/etc/passwd
-# whiteouts: a deleted image program, and a first-boot script that removed itself
+# the same link target spelled differently, a new link to an image program, a link to
+# something else, and an image data file (no program) with other content
+ln -s /bin/busybox $U/usr/bin/awk
+ln -s /bin/busybox $U/usr/bin/login
+ln -s /tmp/.cache/x $U/usr/bin/stray
+cp -a /usr/lib/os-release $U/usr/lib/os-release && echo 'X=1' >> $U/usr/lib/os-release
+# whiteouts: a deleted image program, a first-boot script that removed itself, and a
+# disabled service
 if mknod $U/usr/sbin/uhttpd c 0 0 2>/dev/null; then
+    mknod $U/etc/rc.d/S50cron c 0 0
     mknod $U/etc/uci-defaults/$(ls /etc/uci-defaults | head -n 1) c 0 0
     echo yes
 else
@@ -108,7 +119,7 @@ class TestOverlayDiff(Fixture):
     def test_classification(self):
         e = self.entries(self.tool_ok("overlay_diff", BOTH))
         want = {
-            "/usr/bin/jshn": (1, "changed", "image file replaced"),
+            "/usr/bin/jshn": (1, "changed", "image program replaced after first boot"),
             "/bin/ubus": (1, "mode", "setuid or setgid bit set"),
             "/usr/bin/gl-helper": (2, "added", "program not in the image, no package owns it"),
             "/etc/init.d/gl_helper": (2, "added", "autostart entry not in the image (init)"),
@@ -123,6 +134,13 @@ class TestOverlayDiff(Fixture):
             self.assertEqual((e[path]["prio"], e[path]["status"]), (prio, status), path)
             self.assertIn(why, e[path]["why"], path)
         self.assertIn("package jshn (image)", e["/usr/bin/jshn"]["why"])
+        # "/bin/busybox" and the image's "../../bin/busybox" are the same target
+        self.assertEqual((e["/usr/bin/awk"]["prio"], e["/usr/bin/awk"]["status"]), (5, "same"))
+        self.assertEqual(e["/usr/bin/login"]["prio"], 4)
+        self.assertIn("link to a program of the image (/bin/busybox)", e["/usr/bin/login"]["why"])
+        self.assertEqual(e["/usr/bin/stray"]["prio"], 2)
+        self.assertEqual((e["/usr/lib/os-release"]["prio"], e["/usr/lib/os-release"]["status"]), (3, "changed"))
+        self.assertIn("data or configuration file of the image changed", e["/usr/lib/os-release"]["why"])
         self.assertIn("image: mode 0755", e["/bin/ubus"]["why"])
         self.assertRegex(e["/usr/bin/jshn"]["meta"], r"^f 0755 root:root +\d+ \d{4}-\d\d-\d\d \d\d:\d\d:\d\d /usr")
         # plain directories that the image has too are not entries
@@ -138,25 +156,27 @@ class TestOverlayDiff(Fixture):
         first_boot = [p for p in e if p.startswith("/etc/uci-defaults/")]
         self.assertEqual(len(first_boot), 1)
         self.assertEqual((e[first_boot[0]]["prio"], e[first_boot[0]]["status"]), (5, "deleted"))
+        self.assertEqual(e["/etc/rc.d/S50cron"]["prio"], 4)
+        self.assertIn("service disabled", e["/etc/rc.d/S50cron"]["why"])
         only = self.entries(self.tool_ok("overlay_diff", BOTH, status="deleted"))
-        self.assertEqual(set(only), {"/usr/sbin/uhttpd", first_boot[0]})
+        self.assertEqual(set(only), {"/usr/sbin/uhttpd", "/etc/rc.d/S50cron", first_boot[0]})
 
     def test_ordered_by_priority(self):
         text = self.tool_ok("overlay_diff", BOTH)
         prios = [int(p) for p in re.findall(r"^P(\d) ", text, flags=re.M)]
         self.assertEqual(prios, sorted(prios))
         self.assertGreaterEqual(len(prios), 9)
-        self.assertRegex(text, r"entries: \d+  \(added 4, changed 3, mode/owner 1,")
+        self.assertRegex(text, r"entries: \d+  \(added 6, changed 4, mode/owner 1,")
 
     def test_filters(self):
         e = self.entries(self.tool_ok("overlay_diff", BOTH, path="/usr/bin"))
-        self.assertEqual(set(e), {"/usr/bin/jshn", "/usr/bin/gl-helper"})
+        self.assertEqual(set(e), {"/usr/bin/jshn", "/usr/bin/gl-helper", "/usr/bin/awk", "/usr/bin/login", "/usr/bin/stray"})
         e = self.entries(self.tool_ok("overlay_diff", BOTH, max_priority=1))
         self.assertEqual(set(e), {"/usr/bin/jshn", "/bin/ubus"})
         e = self.entries(self.tool_ok("overlay_diff", BOTH, status="changed"))
-        self.assertEqual(set(e), {"/usr/bin/jshn", "/bin/ubus", "/etc/passwd", "/etc/config/firewall"})
+        self.assertEqual(set(e), {"/usr/bin/jshn", "/bin/ubus", "/etc/passwd", "/etc/config/firewall", "/usr/lib/os-release"})
         e = self.entries(self.tool_ok("overlay_diff", BOTH, status="unchanged"))
-        self.assertEqual(set(e), {"/etc/banner"})
+        self.assertEqual(set(e), {"/etc/banner", "/usr/bin/awk"})
         self.assertIn("no entries", self.tool_ok("overlay_diff", BOTH, path="/www"))
         text, err = self.tool("overlay_diff", BOTH, status="weird")
         self.assertTrue(err)

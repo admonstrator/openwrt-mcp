@@ -49,26 +49,33 @@ fo_uci() {
 
 # fo_overlay UPPER PREFIX: every entry of the overlay's upper directory below PREFIX,
 # classified and sorted by priority, then path. Tab separated:
-#   prio status why state detail type mode uid gid size mtime path target pkg qual
-# status: added changed mode deleted same. prio 1 (look first) to 5 (expected).
+#   prio status why state detail type mode uid gid size mtime path target pkg qual fb
+# status: added changed mode deleted same. prio 1 (look first) to 5 (expected). fb is
+# "firstboot" for entries written in the first-boot window (see fx_firstboot).
 # Directories that also exist in the image are left out.
 fo_overlay() {
 	_ou=${1%/}
 	_os=$_ou$2/
 	[ "$2" = / ] && _os=$_ou/
 	[ -d "$_os" ] || return 0
-	find "$_os" -xdev -mindepth 1 -print0 2>/dev/null | fx_ls | head -n 20001 | fx_cmp "$_ou" 1 | fx_pkg |
-		awk -F'\t' "$FO_AWK_LOC"'
+	find "$_os" -xdev -mindepth 1 -print0 2>/dev/null | fx_ls | head -n 20001 | fx_cmp "$_ou" 1 | fx_pkg | fx_firstboot "$_ou" |
+		FX_UP="$_ou" FX_ROM="${MCP_ROM%/}" awk -F'\t' "$FX_AWK_LS$FO_AWK_LOC"'
+		# a regular file that exists below ROOT (no process needed: getline fails on a missing file)
+		function isfile(root, p,   l, r) { r = (getline l < (root p)); close(root p); return (r >= 0) }
 		BEGIN { OFS = "\t" }
 		{
-			st = $1; type = $3; mode = $4; size = $7; p = $9; pkg = $11; q = $12
+			st = $1; type = $3; mode = $4; size = $7; p = $9; pkg = $11; q = $12; fb = ($13 == "firstboot")
 			loc = fo_loc(p); code = fo_code(p); exec = (type == "f" && mode ~ /[1357]/ && substr(mode, 2) ~ /[1357]/)
+			# a program, as opposed to a data or configuration file that lives next to programs
+			prog = (type == "l" || exec || loc != "" || p ~ /\.(so|ko|lua|uc|sh|js|ut|htm|py|pl)(\.[0-9.]+)?$/ || \
+				p ~ /^\/(lib\/(functions|netifd|preinit|upgrade)|usr\/libexec|www\/cgi-bin)\//)
 			prio = 4; status = "added"; why = ""
 			if (type == "c" && size == "0,0") {
 				status = "deleted"
 				if (st == "new") { prio = 4; why = "whiteout for a path the image does not have" }
 				else if (loc == "uci_defaults") { prio = 5; why = "first-boot script ran and removed itself (expected)" }
 				else if (q == "removed") { prio = 4; why = "removed with package " pkg }
+				else if (p ~ /^\/etc\/rc\.d\//) { prio = 4; why = "service disabled" }
 				else if (code || loc != "") { prio = 2; why = "image file deleted" }
 				else { prio = 4; why = "image file deleted (configuration)" }
 			} else if (type == "d") {
@@ -90,7 +97,9 @@ fo_overlay() {
 				if (fo_expected(p)) { prio = 5; why = "configuration or device state (expected)" }
 				else if (code || loc == "init" || loc == "hotplug" || loc == "inittab") {
 					if (q ~ /^upgraded/) { prio = 3; why = "replaced by an upgrade of package " pkg " (the package database is writable: a hint, not proof)" }
-					else { prio = 1; why = "image file replaced" }
+					else if (fb) { prio = 4; why = "changed by the firmware at first boot" }
+					else if (!prog) { prio = 3; why = "data or configuration file of the image changed" }
+					else { prio = 1; why = "image program replaced after first boot" }
 				}
 				else if (loc == "sysupgrade" || loc == "hosts" || loc == "feeds" || loc == "modules") { prio = 3; why = "changed: " loc }
 				else if (loc != "") { prio = 2; why = "autostart location changed (" loc ")" }
@@ -98,10 +107,13 @@ fo_overlay() {
 				else { prio = 4; why = "configuration changed" }
 			} else {
 				status = "added"
+				t = (type == "l") ? fx_resolve(p, $10) : ""
 				if (fo_expected(p)) { prio = 5; why = "configuration or device state (expected)" }
 				else if (q == "added") { prio = 4; why = "from package " pkg ", installed after flashing" }
 				else if (loc == "ssh_keys") { prio = 2; why = "authorized SSH keys added (see users_auth)" }
 				else if (p ~ /^\/etc\/rc\.d\// && $10 ~ /^\.\.\/init\.d\/[^\/]+$/) { prio = 4; why = "service enabled or disabled" }
+				else if (type == "l" && fo_code(t) && isfile(ENVIRON["FX_ROM"], t) && !isfile(ENVIRON["FX_UP"], t)) { prio = 4; why = "link to a program of the image (" t ")" }
+				else if (fb && (code || loc != "")) { prio = 4; why = "created by the firmware at first boot" }
 				else if (loc == "sysupgrade" || loc == "hosts" || loc == "feeds" || loc == "modules") { prio = 3; why = "added: " loc }
 				else if (loc != "") { prio = 2; why = "autostart entry not in the image (" loc "), no package owns it" }
 				else if (code && (exec || type == "l" || p ~ /\.(so|ko)(\.[0-9.]+)?$/)) { prio = 2; why = "program not in the image, no package owns it" }
@@ -109,13 +121,13 @@ fo_overlay() {
 				else if (exec) { prio = 3; why = "executable outside the system directories" }
 				else { prio = 4; why = "added" }
 			}
-			print prio "\t" p, prio, status, why, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+			print prio "\t" p, prio, status, why, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
 		}' | sort | cut -f3-
 }
 
 # ---------------------------------------------------------------- overlay_diff
 mcp_register overlay_diff <<'EOF'
-{"name":"overlay_diff","title":"Overlay against firmware image","description":"Lists everything the writable overlay adds, changes or deletes compared with the firmware image: per entry status, type, mode, owner, size, mtime, what the image has instead and which package owns the path. Entries are ordered by priority: 1 image programs replaced, setuid added, ld.so.preload; 2 new programs or autostart entries no package owns, deleted image files; 3 package upgrades, account files, mode changes; 4 package installs and other configuration; 5 expected state (/etc/config, host keys, package database). Use it to answer what differs from the shipped firmware; without an overlay (x86 ext4, initramfs) it says so.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Only entries below this absolute path, e.g. /usr/bin. Default /.","default":"/"},"status":{"type":"string","enum":["all","added","changed","deleted","unchanged"],"description":"Only entries with this status; changed includes mode and owner changes, unchanged are files copied up with identical content. Default all.","default":"all"},"max_priority":{"type":"integer","description":"Only entries of this priority or more urgent (1 = most urgent). Default 5 (everything).","default":5,"minimum":1,"maximum":5},"offset":{"type":"integer","description":"Entries to skip, for paging. Default 0.","default":0,"minimum":0},"max_results":{"type":"integer","description":"Entries to return. Default 200.","default":200,"minimum":1,"maximum":1000}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"overlay_diff","title":"Overlay against firmware image","description":"Lists everything the writable overlay adds, changes or deletes compared with the firmware image: per entry status, type, mode, owner, size, mtime, what the image has instead and which package owns the path. Entries are ordered by priority: 1 image programs replaced after first boot, setuid added, ld.so.preload; 2 new programs or autostart entries no package owns, deleted image files; 3 package upgrades, account files, mode changes, changed data files; 4 package installs, what the firmware wrote at first boot, other configuration; 5 expected state (/etc/config, host keys, package database). Use it to answer what differs from the shipped firmware; without an overlay (x86 ext4, initramfs) it says so.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Only entries below this absolute path, e.g. /usr/bin. Default /.","default":"/"},"status":{"type":"string","enum":["all","added","changed","deleted","unchanged"],"description":"Only entries with this status; changed includes mode and owner changes, unchanged are files copied up with identical content. Default all.","default":"all"},"max_priority":{"type":"integer","description":"Only entries of this priority or more urgent (1 = most urgent). Default 5 (everything).","default":5,"minimum":1,"maximum":5},"offset":{"type":"integer","description":"Entries to skip, for paging. Default 0.","default":0,"minimum":0},"max_results":{"type":"integer","description":"Entries to return. Default 200.","default":200,"minimum":1,"maximum":1000}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_overlay_diff() {
 	fx_path p path / || return 1
@@ -153,6 +165,9 @@ tool_overlay_diff() {
 		}' "$rec"
 	echo "columns: priority status type mode owner:group bytes mtime path [reason; what the image has; package]"
 	echo "notes: package ownership comes from the writable package database (a hint, not proof). Opaque directories (trusted.overlay.opaque) cannot be detected: busybox cannot read xattrs."
+	if fbw=$(fx_fbwindow); then
+		echo "first boot: entries with mtime and ctime between ${fbw%%"$FX_TAB"*} and ${fbw#*"$FX_TAB"} (the hour after the newest file of the image's /etc, where the clock starts before NTP) count as written by the firmware itself; a forged system clock could place a file there."
+	fi
 	[ "$(wc -l <"$rec")" -gt 20000 ] && echo "note: more than 20000 overlay entries, the scan stopped there; pass path to scan a subtree"
 	echo
 	awk -F'\t' -v want="$status" -v maxp="$maxp" -v off="$off" -v max="$max" '
@@ -173,6 +188,7 @@ tool_overlay_diff() {
 			x = $3
 			if ($5 != "-") x = x "; " $5
 			if ($14 != "-") x = x "; package " $14 " (" $15 ")"
+			if ($16 == "firstboot" && $2 != "same" && $2 != "deleted") x = x "; written at first boot"
 			if ($2 == "deleted") printf "P%s %-7s %s  [%s]\n", $1, $2, $12, x
 			else printf "P%s %-7s %s %s %-11s %9s %s %s%s  [%s]\n", $1, $2, $6, $7, own, $10, $11, $12, ($13 != "-") ? " -> " $13 : "", x
 		}
@@ -189,7 +205,8 @@ tool_overlay_diff() {
 # ---------------------------------------------------------------- persistence
 # fo_persist: one record per file or link in a persistence location, compared with the
 # image. Tab separated:
-#   loc state detail type mode uid gid size mtime path target pkg qual
+#   loc state detail type mode uid gid size mtime path target pkg qual fb
+# fb is "firstboot" for entries written in the first-boot window (see fx_firstboot).
 fo_persist() {
 	set -- /etc/crontabs /etc/cron.d /etc/rc.local /etc/init.d /etc/rc.d /etc/rc.common /etc/rc.button \
 		/etc/preinit /etc/inittab /etc/hotplug.d /etc/hotplug.json /etc/hotplug-preinit.json \
@@ -209,7 +226,7 @@ fo_persist() {
 		find "$@" -maxdepth 4 ! -type d -print0 2>/dev/null
 		fo_keyfiles | tr '\n' '\0'
 		cut -f2 "$MCP_TMP/persist.extra" | tr '\n' '\0'
-	} | fx_ls | head -n 5000 | fx_cmp "" 1 | fx_pkg | FX_X="$MCP_TMP/persist.extra" awk -F'\t' "$FO_AWK_LOC"'
+	} | fx_ls | head -n 5000 | fx_cmp "" 1 | fx_pkg | fx_firstboot "" | FX_X="$MCP_TMP/persist.extra" awk -F'\t' "$FO_AWK_LOC"'
 		BEGIN {
 			OFS = "\t"; split("'"$FO_LOCS"'", o, " "); for (i in o) ord[o[i]] = sprintf("%02d", i)
 			while ((getline x < ENVIRON["FX_X"]) > 0) { split(x, f, "\t"); extra[f[2]] = f[1] }
@@ -330,7 +347,7 @@ tool_persistence() {
 		*) class=lines ;;
 		esac
 		nquiet=0
-		while IFS="$FX_TAB" read -r _ st det ty mo ui gi sz mt path tg pkg qual; do
+		while IFS="$FX_TAB" read -r _ st det ty mo ui gi sz mt path tg pkg qual fb; do
 			case $st in same) mark="[same]" ;; changed) mark="[CHANGED]" ;; new) mark="[new]" ;; meta) mark="[meta]" ;; noimage) mark="[-]" ;; *) mark="[?]" ;; esac
 			if [ "$st" = same ] && [ "$only" = 1 ]; then continue; fi
 			if [ "$class" = scripts ] || [ "$class" = lines ]; then
@@ -344,6 +361,7 @@ tool_persistence() {
 			printf '  (%s %s %s:%s, %s bytes, %s' "$ty" "$mo" "$ui" "$gi" "$sz" "$mt"
 			[ "$det" != - ] && printf '; %s' "$det"
 			if [ "$pkg" != - ]; then printf '; package %s, %s' "$pkg" "$qual"; else printf '; no package'; fi
+			[ "$fb" = firstboot ] && [ "$st" != same ] && printf '; written at first boot'
 			printf ')\n'
 			[ "$ty" = f ] || continue
 			if [ "$class" = keys ]; then

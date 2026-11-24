@@ -291,11 +291,27 @@ relation to the image (`image`, `upgraded old>new`, `added`, `removed`).
 
 | Priority | Meaning |
 | --- | --- |
-| 1 | An image program or image init/hotplug script replaced, a setuid/setgid bit added, `/etc/ld.so.preload` |
+| 1 | An image program or image init/hotplug script replaced after first boot, a setuid/setgid bit added, `/etc/ld.so.preload` |
 | 2 | Programs and autostart entries that neither the image nor a package provides, authorized keys, deleted image programs |
-| 3 | Files replaced by a package upgrade, account files, mode or owner changes, unowned data files, feeds |
-| 4 | Files of packages installed after flashing, services enabled or disabled, other configuration |
+| 3 | Files replaced by a package upgrade, changed data or configuration files of the image in program directories, account files, mode or owner changes, unowned data files, feeds |
+| 4 | Files of packages installed after flashing, what the firmware wrote at first boot, links to image programs, services enabled or disabled, other configuration |
 | 5 | Expected state: `/etc/config`, host keys, the package database, first-boot scripts that removed themselves, identical copies |
+
+A program, as opposed to a data file next to programs, is a file with an execute bit, a
+link, a code file by name (`.so`, `.ko`, `.lua`, `.uc`, `.sh`, `.js`, ...), anything below
+`/lib/functions`, `/lib/netifd`, `/lib/preinit`, `/lib/upgrade`, `/usr/libexec`,
+`/www/cgi-bin`, or an autostart location. Link targets are compared as resolved paths:
+`busybox` in `/bin` and `/bin/busybox` are the same.
+
+First boot: OpenWrt has no clock at its first boot; sysfixtime sets it to the newest file
+below `/etc` of the image, and it runs from there until NTP answers. What the firmware's
+own first-boot scripts write is therefore dated within minutes after that file. An entry
+whose mtime and ctime both lie in the hour after the newest file of `$MCP_ROM/etc` counts
+as written at first boot (priority 4, marked in the output). `touch` cannot set a ctime,
+so back-dating the mtime does not move a file into the window; setting the system clock
+back would, and the output says so. No window is used when the device's own clock still
+stands inside it. `MCP_FIRSTBOOT_CTIME=0` judges by mtime alone; it exists for the tests,
+which cannot create a file with an old ctime.
 
 Limits: package ownership comes from the writable package database (opkg `.list` files
 or apk's `installed`), so it lowers a priority but proves nothing, and the output says
@@ -341,7 +357,7 @@ lines (at most 25), why it matters and what to do.
 
 | Check | Severity | Evidence |
 | --- | --- | --- |
-| `exposure.wan_input_accept` | high (medium when no WAN interface has an address) | WAN zone with `input=ACCEPT`, and the sockets listening on all addresses |
+| `exposure.wan_input_accept` | high (medium when no WAN interface has an address) | WAN zone with `input=ACCEPT`, its devices, and the sockets it reaches |
 | `exposure.wan_open_port` | medium | listening socket plus the uci rule that accepts its port from the WAN zone |
 | `exposure.port_forward` | low | uci redirects from the WAN zone |
 | `exposure.firewall_not_loaded` | low | no `fw4` table (nft) or no `zone_*` chains (iptables-save) |
@@ -352,22 +368,27 @@ lines (at most 25), why it matters and what to do.
 | `auth.empty_password` | medium | other login accounts with an empty password |
 | `auth.account_added` | low | login accounts that are not in the image |
 | `auth.authorized_keys` | low | every authorized key with its fingerprint |
-| `integrity.image_file_replaced` | high | overlay holds another version of an image program, no package upgrade explains it |
+| `integrity.image_file_replaced` | high | overlay holds another version of an image program, written after first boot, no package upgrade explains it |
+| `integrity.image_data_changed` | low | a data or configuration file of the image in a program directory differs, changed after first boot |
+| `integrity.first_boot_changes` | info | files in program directories that the firmware wrote at first boot |
 | `integrity.setuid_added` | high | setuid or setgid bit on an image program |
 | `integrity.process_deleted_tmp_binary` | high | process whose program was deleted from `/tmp`, `/var`, `/dev/shm` |
-| `integrity.ld_preload` | high with `LD_PRELOAD` in a process or on glibc, else medium | `/etc/ld.so.preload` lines, process environments |
+| `integrity.ld_preload` | high with `LD_PRELOAD` in a process or on glibc, else medium | `/etc/ld.so.preload` lines, process environments; a preloaded library that equals its image copy (procd's `/lib/libsetlbf.so`) is not reported |
 | `integrity.unowned_program` | medium | program in a system directory that neither the image nor a package provides |
-| `integrity.tmp_executable` | medium | executable files in `/tmp` and `/dev/shm` |
+| `integrity.tmp_executable` | medium with an ELF file, else low | executable ELF files and scripts with at least one command in `/tmp` and `/dev/shm`; executable data files are not listed |
 | `integrity.process_tmp_binary` | medium | process running from the RAM disk |
 | `integrity.process_deleted_binary` | medium | process whose program file is gone (elsewhere) |
 | `integrity.process_not_from_image` | medium | process running a program that neither the image nor an added package provides |
 | `integrity.kernel_module_not_in_image` | medium | loaded module without a `.ko` in the image |
 | `integrity.mount_over_system_path` | medium | a mount on `/bin`, `/sbin`, `/lib`, `/usr`, `/www` or below |
-| `integrity.image_file_deleted` | low | whiteouts for image programs (not when the package was removed) |
+| `integrity.image_file_deleted` | low | whiteouts for image programs (not when the package was removed, not `/etc/rc.d` links of disabled services) |
 | `integrity.package_upgrades` | info | image files replaced by a package upgrade, counted per package |
-| `persistence.image_script_changed` | high | image init, hotplug, inittab, rpcd or LuCI script that differs from the image |
-| `persistence.autostart_added` | medium | autostart file that neither the image nor a package provides |
-| `persistence.user_autostart` | low; medium when a line downloads, pipes into a shell or uses the RAM disk | active lines of cron files, `rc.local`, changed profile, firewall and dnsmasq files |
+| `persistence.image_script_changed` | high | image init, hotplug, inittab, rpcd or LuCI script that differs from the image, changed after first boot |
+| `persistence.autostart_added` | medium | autostart file that neither the image nor a package provides (not dnsmasq files, not `.nft` files, not first-boot files) |
+| `persistence.dnsmasq_hook` | medium | `dhcp-script`, `dhcp-luascript` or `conf-script` in a dnsmasq file that differs from the image, or uci `dhcpscript`, naming a program that is not an unchanged image file |
+| `persistence.firewall_rules_added` | low | `.nft` rule files that neither the image nor a package provides |
+| `persistence.first_boot_changes` | info | startup scripts that the firmware wrote at first boot |
+| `persistence.user_autostart` | low; medium when a line downloads, pipes into a shell or uses the RAM disk | active lines of cron files (not crond's `cron.update`), `rc.local`, changed profile and firewall scripts |
 | `persistence.feeds_changed` | low | package feeds or keys that differ from the image |
 | `persistence.package_autostart` | info | autostart files of packages installed after flashing |
 | `updates.branch_eol` | medium (low on GL.iNet firmware) | `DISTRIB_RELEASE` on a branch in the built-in end-of-life list (17.01 to 23.05, as of 2026-11) |
@@ -379,11 +400,15 @@ lines (at most 25), why it matters and what to do.
 | `wifi.open_uplink` | low | client interface on an unencrypted network |
 
 How far the exposure check reasons: it reads the zones, rules and redirects from
-`/etc/config/firewall` and matches them against the listening sockets from `/proc`
-(wildcard addresses and addresses of the WAN devices). It does not evaluate the loaded
-nft or iptables ruleset rule by rule, so custom includes can open or close more; the
-finding's confidence line says so. The stock rules for the DHCP clients (udp 68, 546)
-are not reported.
+`/etc/config/firewall`. A zone faces the internet when it holds the network `wan` or
+`wan6` (or is named so) or when one of its devices carries the default route;
+masquerading alone does not make a WAN zone, so VPN and Tailscale zones with
+`input=ACCEPT` are not reported. The devices of a zone come from netifd (`l3_device`),
+uci and the zone's `device` option. A socket from `/proc` counts as reachable from a zone
+when it is bound to all addresses or to an address on one of the zone's devices. The
+loaded nft or iptables ruleset is not evaluated rule by rule, so custom includes can open
+or close more; the finding's confidence line says so. The stock rules for the DHCP
+clients (udp 68, 546) are not reported.
 
 Each thing is reported by one check: autostart locations belong to the persistence
 checks, so the integrity checks skip them, and a socket the zone policy already opens is

@@ -9,7 +9,7 @@
 # MCP_PROC (default /proc) is where the process checks read exe links, environments and
 # the module list. It exists for the tests: in an emulated container every exe link
 # points at the emulator. Sockets always come from the real /proc (lib_sockets).
-# shellcheck disable=SC2154,SC2016  # arg/arg_int/fx_path assign through eval; awk programs are single-quoted on purpose
+# shellcheck disable=SC2154,SC2016,SC2153  # arg/arg_int/fx_path assign through eval; awk programs are single-quoted on purpose
 : "${MCP_PROC:=/proc}"
 
 # Release branches without security support. Checked against openwrt.org in 2026-11;
@@ -48,15 +48,32 @@ au_kind() {
 	esac
 }
 
+# The confidence text for everything that rests on the first-boot window.
+au_fbconf() {
+	if _fw=$(fx_fbwindow); then
+		AU_FBCONF="mtime and ctime lie between ${_fw%%"$FX_TAB"*} and ${_fw#*"$FX_TAB"}, the hour after the newest file of the image's /etc, which is where the clock stands at first boot before NTP answers; someone who sets the system clock back could date a file into that hour"
+	else
+		AU_FBCONF="no first-boot window could be determined"
+	fi
+}
+
 au_cmdline() { tr '\000' ' ' <"$MCP_PROC/$1/cmdline" 2>/dev/null | cut -c1-160; }
 
 # ---------------------------------------------------------------- exposure
-# Writes $AU/fw (zones, allow rules, redirects from uci), $AU/reach (listeners the WAN
-# side may connect to) and the exposure findings. The auth checks read $AU/reach.
+# Which zones face the internet: a zone that holds the network wan or wan6 (or is named
+# so), or whose devices include the device of the default route. Masquerading alone
+# does not make a zone a WAN zone: VPN and Tailscale zones masquerade too.
+# A socket counts as reachable from a zone when it is bound to all addresses or to an
+# address on one of that zone's devices.
+#
+# Writes $AU/fw (zones, accept rules, redirects from uci), $AU/wanz (WAN zone and its
+# devices), $AU/zaddr (WAN zone and each address on its devices), $AU/reach (listeners
+# a WAN zone may connect to). The auth checks read $AU/reach.
 au_exposure_data() {
 	: >"$AU/fw"
 	: >"$AU/reach"
-	: >"$AU/wanaddr"
+	: >"$AU/zaddr"
+	: >"$AU/wanz"
 	lib_sockets >"$AU/socks" 2>/dev/null
 	if ! fo_uci firewall >"$AU/fw.uci" || [ ! -s "$AU/fw.uci" ]; then
 		AU_FW=none
@@ -65,12 +82,6 @@ au_exposure_data() {
 	AU_FW=ok
 	awk '
 	function val(s) { sub(/^[^=]*=/, "", s); gsub(/\047/, "", s); return s }
-	function wanlike(s,   n, w, i) {
-		if (v[s, "name"] ~ /wan/ || v[s, "masq"] == "1") return 1
-		n = split(v[s, "network"], w, " ")
-		for (i = 1; i <= n; i++) if (w[i] ~ /wan|modem|tether/) return 1
-		return 0
-	}
 	/^firewall\.[^.=]+=/ { s = $0; sub(/=.*/, "", s); type[s] = val($0); order[++n] = s; next }
 	{ k = $0; sub(/=.*/, "", k); o = k; sub(/.*\./, "", o); sub(/\.[^.]*$/, "", k); v[k, o] = val($0) }
 	END {
@@ -78,17 +89,15 @@ au_exposure_data() {
 		for (i = 1; i <= n; i++) if (type[order[i]] == "defaults" && v[order[i], "input"] != "") dflt = toupper(v[order[i], "input"])
 		for (i = 1; i <= n; i++) {
 			s = order[i]
-			if (type[s] != "zone" || !wanlike(s)) continue
+			if (type[s] != "zone" || v[s, "name"] == "") continue
 			inp = (v[s, "input"] == "") ? dflt : toupper(v[s, "input"])
-			wz[v[s, "name"]] = 1
-			print "Z", v[s, "name"], inp, (v[s, "network"] == "") ? "-" : v[s, "network"], s
-			if (inp == "ACCEPT") print "A", "zone", "tcp udp", "all", "zone \047" v[s, "name"] "\047 input=ACCEPT (" s ".input in /etc/config/firewall)"
+			print "Z", v[s, "name"], inp, (v[s, "network"] == "") ? "-" : v[s, "network"], (v[s, "device"] == "") ? "-" : v[s, "device"], s
+			if (inp == "ACCEPT") print "A", "zone", v[s, "name"], "tcp udp", "all", "zone \047" v[s, "name"] "\047 input=ACCEPT (" s ".input in /etc/config/firewall)"
 		}
 		for (i = 1; i <= n; i++) {
 			s = order[i]
-			if (v[s, "enabled"] == "0") continue
 			src = v[s, "src"]
-			if (!(src in wz) && src != "*") continue
+			if (v[s, "enabled"] == "0" || src == "") continue
 			if (type[s] == "rule") {
 				if (v[s, "dest"] != "" || toupper(v[s, "target"]) != "ACCEPT") continue
 				pr = tolower(v[s, "proto"]); if (pr == "") pr = "tcp udp"
@@ -98,32 +107,54 @@ au_exposure_data() {
 				t = "rule \047" v[s, "name"] "\047 (" s "): src=" src " proto=" pr " dest_port=" pt " target=ACCEPT"
 				if (v[s, "src_ip"] != "") t = t " src_ip=" v[s, "src_ip"]
 				if (v[s, "src_mac"] != "") t = t " src_mac=" v[s, "src_mac"]
-				print "A", "rule", pr, pt, t
+				print "A", "rule", src, pr, pt, t
 			} else if (type[s] == "redirect") {
 				tg = toupper(v[s, "target"]); if (tg != "" && tg != "DNAT") continue
-				print "R", "redirect \047" v[s, "name"] "\047 (" s "): " src " " ((v[s, "proto"] == "") ? "tcp udp" : v[s, "proto"]) " port " v[s, "src_dport"] " -> " v[s, "dest_ip"] ":" ((v[s, "dest_port"] == "") ? v[s, "src_dport"] : v[s, "dest_port"])
+				print "R", src, "redirect \047" v[s, "name"] "\047 (" s "): " src " " ((v[s, "proto"] == "") ? "tcp udp" : v[s, "proto"]) " port " v[s, "src_dport"] " -> " v[s, "dest_ip"] ":" ((v[s, "dest_port"] == "") ? v[s, "src_dport"] : v[s, "dest_port"])
 			}
 		}
 	}' "$AU/fw.uci" >"$AU/fw"
 
-	# addresses on the devices of the WAN zones; AU_WANDEV: yes | no | unknown
+	# the devices of every zone; AU_WANDEV: yes | no | unknown (a WAN zone has an address)
 	AU_WANDEV=unknown
-	if have ip && have uci; then
-		# shellcheck disable=SC2013  # network names are words
-		for _n in $(awk -F'\t' '$1 == "Z" && $4 != "-" { print $4 }' "$AU/fw"); do
+	_def=
+	if have ip; then
+		_def=$({ ip route show default; ip -6 route show default; } 2>/dev/null |
+			awk '$1 == "default" { for (i = 2; i < NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u | tr '\n' ' ')
+	fi
+	awk -F'\t' '$1 == "Z"' "$AU/fw" >"$AU/zones"
+	while IFS="$FX_TAB" read -r _ _zn _ _znet _zdev _; do
+		_devs=
+		[ "$_zdev" != - ] && _devs=$_zdev
+		_wan=0
+		case $_zn in wan | wan6) _wan=1 ;; esac
+		[ "$_znet" = - ] && _znet=
+		for _n in $_znet; do
+			case $_n in wan | wan6) _wan=1 ;; esac
 			_d=
 			if have ubus; then _d=$(ubus -t 2 call "network.interface.$_n" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); fi
-			[ -n "$_d" ] || _d=$(uci -q get "network.$_n.device" 2>/dev/null) || _d=$(uci -q get "network.$_n.ifname" 2>/dev/null)
-			[ -n "$_d" ] || continue
-			[ "$AU_WANDEV" = unknown ] && AU_WANDEV=no
-			for _dd in $_d; do
-				ip -o addr show dev "$_dd" 2>/dev/null | awk '{ a = $4; sub(/\/.*/, "", a); if (a !~ /^fe80:/) print a }' >>"$AU/wanaddr"
-			done
+			if [ -z "$_d" ] && have uci; then
+				_d=$(uci -q get "network.$_n.device" 2>/dev/null) || _d=$(uci -q get "network.$_n.ifname" 2>/dev/null)
+				_pr=$(uci -q get "network.$_n.proto" 2>/dev/null)
+				case $_pr in pppoe | pppoa | pptp | l2tp) _d="$_d $_pr-$_n" ;; esac
+			fi
+			_devs="$_devs $_d"
 		done
-		[ -s "$AU/wanaddr" ] && AU_WANDEV=yes
-	fi
+		for _d in $_devs; do
+			case " $_def " in *" $_d "*) _wan=1 ;; esac
+		done
+		[ "$_wan" = 1 ] || continue
+		# shellcheck disable=SC2086,SC2116  # echo squeezes the blanks of the list
+		printf '%s\t%s\n' "$_zn" "$(echo ${_devs:--})" >>"$AU/wanz"
+		have ip || continue
+		for _d in $_devs; do
+			[ "$AU_WANDEV" = unknown ] && AU_WANDEV=no
+			ip -o addr show dev "$_d" 2>/dev/null | awk -v z="$_zn" '{ a = $4; sub(/\/.*/, "", a); print z "\t" a }' >>"$AU/zaddr"
+		done
+	done <"$AU/zones"
+	[ -s "$AU/zaddr" ] && AU_WANDEV=yes
 
-	FX_W="$AU/wanaddr" FX_F="$AU/fw" awk -F'\t' '
+	FX_A="$AU/zaddr" FX_W="$AU/wanz" FX_F="$AU/fw" awk -F'\t' '
 	function portmatch(list, port,   n, a, i, r) {
 		if (list == "all") return 1
 		n = split(list, a, " ")
@@ -135,24 +166,32 @@ au_exposure_data() {
 		return 0
 	}
 	BEGIN { OFS = "\t" }
-	FILENAME == ENVIRON["FX_W"] { wan[$1] = 1; next }
-	FILENAME == ENVIRON["FX_F"] { if ($1 == "A") { n++; kind[n] = $2; pr[n] = $3; pt[n] = $4; txt[n] = $5 } next }
+	FILENAME == ENVIRON["FX_A"] { za[$1, $2] = 1; anyz[$2] = 1; next }
+	FILENAME == ENVIRON["FX_W"] { wz[$1] = 1; next }
+	FILENAME == ENVIRON["FX_F"] {
+		if ($1 == "A" && (($3 in wz) || $3 == "*")) { n++; kind[n] = $2; zone[n] = $3; pr[n] = $4; pt[n] = $5; txt[n] = $6 }
+		next
+	}
 	{
 		p = $1; sub(/6$/, "", p)
 		if (p == "tcp" && $2 != "LISTEN") next
 		if (p == "udp" && ($2 != "UNCONN" || $4 == 0)) next
 		if (p != "tcp" && p != "udp") next
-		if ($3 != "0.0.0.0" && $3 != "::" && !($3 in wan)) next
+		wild = ($3 == "0.0.0.0" || $3 == "::")
 		# zone entries come first: a socket the zone policy already opens is reported
 		# once, not again for every rule that also matches
 		for (i = 1; i <= n; i++) {
+			if (!wild) {
+				if (zone[i] == "*") { if (!($3 in anyz)) continue }
+				else if (!((zone[i], $3) in za)) continue
+			}
 			if (index(pr[i], p) == 0 || !portmatch(pt[i], $4)) continue
 			# the DHCP clients answer on these ports; the stock rules open them
 			if (kind[i] == "rule" && p == "udp" && ($4 == 68 || $4 == 546)) continue
 			print kind[i], p, $4, sprintf("%s %s:%s pid %s (%s)", $1, $3, $4, $8, $9), txt[i]
 			break
 		}
-	}' "$AU/wanaddr" "$AU/fw" "$AU/socks" >"$AU/reach"
+	}' "$AU/zaddr" "$AU/wanz" "$AU/fw" "$AU/socks" >"$AU/reach"
 }
 
 au_exposure() {
@@ -168,18 +207,20 @@ au_exposure() {
 	_sev=high
 	[ "$AU_WANDEV" = no ] && _sev=medium
 	{
-		awk -F'\t' '$1 == "Z" && $3 == "ACCEPT" { print "zone \047" $2 "\047 (" $5 " in /etc/config/firewall): input=ACCEPT, networks: " $4 }' "$AU/fw"
+		FX_W="$AU/wanz" awk -F'\t' '
+			FILENAME == ENVIRON["FX_W"] { wz[$1] = $2; next }
+			$1 == "Z" && $3 == "ACCEPT" && ($2 in wz) { print "zone \047" $2 "\047 (" $6 " in /etc/config/firewall): input=ACCEPT, networks: " $4 ", devices: " wz[$2] }' "$AU/wanz" "$AU/fw"
 		awk -F'\t' '$1 == "zone" { print "reachable: " $4 }' "$AU/reach"
 	} | au_add "$_sev" exposure.wan_input_accept "$_conf" \
 		"The WAN zone accepts every incoming connection" \
-		"With input=ACCEPT on the WAN zone, every service that listens on all addresses (SSH, the web interface, DNS) can be reached from the internet side." \
+		"With input=ACCEPT on the zone that faces the internet, every service that listens on all addresses or on a WAN address (SSH, the web interface, DNS) can be reached from outside." \
 		"Set the zone's input to REJECT (uci set firewall.<zone>.input='REJECT'; uci commit firewall; service firewall reload) unless this device is a pure access point behind another router. The firewall tool shows the loaded rules."
 	awk -F'\t' '$1 == "rule" { print $4 "  <- " $5 }' "$AU/reach" |
 		au_add medium exposure.wan_open_port "$_conf" \
 			"Services reachable from the WAN side through a firewall rule" \
 			"Each listed socket listens on all addresses (or a WAN address) and a rule accepts its port from the WAN zone, so it is exposed to the internet side." \
 			"Confirm that each rule is intended. Remove rules nobody remembers adding, or restrict them with src_ip."
-	awk -F'\t' '$1 == "R" { print $2 }' "$AU/fw" |
+	FX_W="$AU/wanz" awk -F'\t' 'FILENAME == ENVIRON["FX_W"] { wz[$1] = 1; next } $1 == "R" && (($2 in wz) || $2 == "*") { print $3 }' "$AU/wanz" "$AU/fw" |
 		au_add low exposure.port_forward "high: read from /etc/config/firewall" \
 			"Port forwards from the WAN side" \
 			"A port forward exposes a device inside the network to the internet. Malware also adds forwards to keep access." \
@@ -285,14 +326,25 @@ au_auth() {
 # ---------------------------------------------------------------- integrity
 au_integrity() {
 	_up=
+	au_fbconf
 	if _up=$(fx_upper) && fx_rom_ok; then
 		fo_overlay "$_up" / >"$AU/ov"
 		_ev='{ x = $12 ": " (($6 == "l") ? "symlink -> " $13 : $10 " bytes, mode " $7) ", mtime " $11; if ($5 != "-") x = x "; " $5; if ($14 != "-") x = x "; package " $14 " (" $15 ")"; print x }'
 		awk -F'\t' "$FO_AWK_LOC"'$1 == 1 && $2 == "changed" && fo_loc($12) == "" '"$_ev" "$AU/ov" |
-			au_add high integrity.image_file_replaced "high: content compared with the firmware image (size, then SHA-256)" \
-				"Programs of the firmware image were replaced" \
-				"These files exist in the image, but the overlay holds a different version, and no package upgrade accounts for it. Replacing a system program is how implants hide (a fake netstat) or survive." \
-				"Compare with file_hash and read_file view=strings. If you did not replace them yourself, treat the router as compromised: save the evidence, reflash the firmware without keeping settings, set new passwords."
+			au_add high integrity.image_file_replaced "high: content compared with the firmware image (size, then SHA-256), and neither written at first boot nor explained by a package upgrade" \
+				"Programs of the firmware image were replaced after first boot" \
+				"These programs exist in the image, but the overlay holds a different version that was written later. That is legitimate if you updated them yourself (an updater script, a manually installed newer version); it is also how an implant hides behind a familiar name." \
+				"For each one: did you or a tool you run replace it at about that time? Compare with file_hash (look the hash up) and read_file view=strings. Only if you cannot account for one, treat it as a compromise: save the evidence and reflash."
+		awk -F'\t' "$FO_AWK_LOC"'$3 ~ /^data or configuration file of the image changed/ && fo_loc($12) == "" '"$_ev" "$AU/ov" |
+			au_add low integrity.image_data_changed "high: content compared with the firmware image" \
+				"Data or configuration files of the image, kept next to programs, were changed" \
+				"These are not programs (no execute bit, no code file type), but they sit in program directories and differ from the image. Services rewrite such files; they can also change how a program behaves." \
+				"Look at the difference if the file matters to you (read_file on the path and on the same path under $MCP_ROM)."
+		awk -F'\t' "$FO_AWK_LOC"'$3 ~ /^(changed|created) by the firmware at first boot/ && fo_loc($12) == "" { print $12 ": " $3 ", mtime " $11 }' "$AU/ov" |
+			au_add info integrity.first_boot_changes "medium: $AU_FBCONF" \
+				"Files in program directories that the firmware itself wrote at first boot" \
+				"The first-boot scripts of the firmware adapt files to the device. They differ from the image without anyone having touched the router; listed so that nothing replaced stays unmentioned." \
+				"Nothing. If one of them looks out of place, compare it with the image (file_hash)."
 		awk -F'\t' '$1 == 1 && $2 == "mode" '"$_ev" "$AU/ov" |
 			au_add high integrity.setuid_added "high: mode compared with the firmware image" \
 				"Setuid or setgid bit added to an image program" \
@@ -306,7 +358,7 @@ au_integrity() {
 		awk -F'\t' '$1 == 2 && $2 == "deleted" { print $12 ": deleted in the overlay; " $5 (($14 != "-") ? "; package " $14 " (" $15 ")" : "") }' "$AU/ov" |
 			au_add low integrity.image_file_deleted "high: whiteout entry in the overlay" \
 				"Files of the firmware image were deleted" \
-				"A deleted system file is unusual unless its package was removed (those are not listed here). Malware removes tools that could expose it." \
+				"A deleted system file is unusual unless its package was removed or a service was disabled (those are not listed here). Malware removes tools that could expose it." \
 				"Check whether you removed them; a firmware reflash restores them."
 		awk -F'\t' '$1 == 3 && $3 ~ /^replaced by an upgrade/ { n[$14]++ } END { for (p in n) print "package " p ": " n[p] " image files replaced, explained by a newer installed version" }' "$AU/ov" |
 			au_add info integrity.package_upgrades "medium: the package database is writable, so this explanation can be forged" \
@@ -322,18 +374,30 @@ au_integrity() {
 		_up=
 	fi
 
-	# executables on the RAM disk
+	# programs on the RAM disk: ELF files and scripts with at least one command. Vendor
+	# firmware marks plenty of data files (JSON, locks, state) executable; those and
+	# scripts that hold nothing but their #! line are not programs.
 	set -- /tmp
 	[ -d /dev/shm ] && set -- "$@" /dev/shm
 	find "$@" -xdev -type f -perm /0111 ! -path '/tmp/openwrt-mcp.*' ! -path "${_up:-/nonexistent}/*" ! -path "${MCP_ROM%/}/*" -print0 2>/dev/null |
-		fx_ls | head -n 60 | awk "$FX_AWK_LS"'{ if (fx_ls($0)) print F_path "\t" F_size "\t" F_mode "\t" F_mtime }' >"$AU/tmpx"
-	while IFS="$FX_TAB" read -r _p _s _m _t; do
-		printf '%s: %s, %s bytes, mode %s, mtime %s\n' "$_p" "$(au_kind "$_p")" "$_s" "$_m" "$_t"
-	done <"$AU/tmpx" |
-		au_add medium integrity.tmp_executable "medium: an executable file on the RAM disk; whether it is malicious needs a look inside" \
-			"Executable files in /tmp or /dev/shm" \
-			"OpenWrt keeps no programs on the RAM disk. Downloaders drop their payload there because it is writable and leaves no trace after a reboot." \
-			"Inspect each with file_hash and read_file; note which process uses it (processes tool) before deleting it."
+		xargs -0 -r awk '
+			FNR == 1 {
+				if (substr($0, 2, 3) == "ELF") { print FILENAME "\tELF program"; nextfile }
+				if (substr($0, 1, 2) != "#!") nextfile
+				kind = "script (" substr($0, 1, 40) ")"; next
+			}
+			/^[ \t]*(#|$)/ { next }
+			{ print FILENAME "\t" kind; nextfile }' 2>/dev/null | head -n 60 >"$AU/tmpk"
+	cut -f1 "$AU/tmpk" | tr '\n' '\0' | fx_ls >"$AU/tmpx"
+	_sev=low
+	grep -q "${FX_TAB}ELF program\$" "$AU/tmpk" && _sev=medium
+	FX_K="$AU/tmpk" awk "$FX_AWK_LS"'
+		FILENAME == ENVIRON["FX_K"] { i = index($0, "\t"); kind[substr($0, 1, i - 1)] = substr($0, i + 1); next }
+		{ if (fx_ls($0)) print F_path ": " kind[F_path] ", " F_size " bytes, mode " F_mode ", mtime " F_mtime }' "$AU/tmpk" "$AU/tmpx" |
+		au_add "$_sev" integrity.tmp_executable "medium: a program on the RAM disk; vendor firmware keeps small helper scripts there too, so whether it is malicious needs a look inside" \
+			"Programs in /tmp or /dev/shm" \
+			"Listed are executable ELF files and scripts with at least one command; executable data files are not. Downloaders drop their payload on the RAM disk because it is writable and leaves no trace after a reboot; services also generate helper scripts there at boot." \
+			"Read each script (read_file) and hash each binary (file_hash); the processes tool shows whether one is running."
 
 	# processes: deleted binaries, binaries on the RAM disk, binaries the image lacks
 	# shellcheck disable=SC2012
@@ -419,9 +483,13 @@ au_integrity() {
 		au_skip integrity.kernel_module_not_in_image "the image has no /lib/modules/$_rel (no image, or its kernel is not the running one)"
 	fi
 
-	# preloaded libraries
+	# preloaded libraries. procd preloads /lib/libsetlbf.so into services that log
+	# their stdout (procd_set_param stdout 1): a preload of a library that equals its
+	# image copy is not reported.
 	_sev=medium
 	ls /lib/ld-musl-* >/dev/null 2>&1 || _sev=high
+	: >"$AU/pre.ok"
+	_okl=" "
 	{
 		if [ -e /etc/ld.so.preload ] || [ -L /etc/ld.so.preload ]; then
 			if _w=$(fx_refuse /etc/ld.so.preload); then
@@ -430,9 +498,27 @@ au_integrity() {
 				rd /etc/ld.so.preload | awk '!/^[ \t]*(#|$)/ { print "/etc/ld.so.preload line " NR ": " $0; n++ } END { if (!n) print "/etc/ld.so.preload exists (no active lines)" }'
 			fi
 		fi
-		for _f in $(grep -l -a 'LD_PRELOAD=' "$MCP_PROC"/[0-9]*/environ 2>/dev/null | head -n 20); do
+		for _f in $(grep -l -a 'LD_PRELOAD=' "$MCP_PROC"/[0-9]*/environ 2>/dev/null | head -n 200); do
 			_v=$(tr '\000' '\n' <"$_f" 2>/dev/null | grep '^LD_PRELOAD=' | head -n 1)
 			[ -n "$_v" ] || continue
+			_bad=0
+			for _l in $(printf '%s' "${_v#LD_PRELOAD=}" | tr ':' ' '); do
+				case $_okl in *" $_l "*) continue ;; esac
+				if fx_rom_ok; then
+					_r=$(rom_path "$_l")
+					if [ -f "$_l" ] && [ ! -L "$_r" ] && [ -f "$_r" ] && [ "$(fx_sum sha256 "$_l")" = "$(fx_sum sha256 "$_r")" ]; then
+						_okl="$_okl$_l "
+					else
+						_bad=1
+					fi
+				elif [ "$_l" != /lib/libsetlbf.so ]; then
+					_bad=1
+				fi
+			done
+			if [ "$_bad" = 0 ]; then
+				echo "$_v" >>"$AU/pre.ok"
+				continue
+			fi
 			_pid=${_f%/environ}
 			_pid=${_pid##*/}
 			echo "pid $_pid ($(cat "$MCP_PROC/$_pid/comm" 2>/dev/null)): environment has $_v"
@@ -440,9 +526,12 @@ au_integrity() {
 	} >"$AU/pre"
 	grep -q 'environment has' "$AU/pre" && _sev=high
 	au_add "$_sev" integrity.ld_preload "high: the file or variable is there; musl (the C library of OpenWrt) ignores /etc/ld.so.preload but honours LD_PRELOAD" \
-		"A library is preloaded into programs" \
-		"Preloading injects code into every program that starts: the standard userland rootkit technique. Nothing in OpenWrt or GL.iNet firmware uses it." \
+		"A library that is not an unchanged part of the image is preloaded into programs" \
+		"Preloading injects code into every program that starts: the standard userland rootkit technique. The one legitimate use on OpenWrt, procd's /lib/libsetlbf.so for services that log their output, is not listed when the library equals the image." \
 		"Inspect the named library with file_hash and read_file view=strings, find what sets it (persistence tool), then remove it." <"$AU/pre"
+	if [ -s "$AU/pre.ok" ] && ! fx_rom_ok; then
+		au_skip integrity.ld_preload "$(wc -l <"$AU/pre.ok") processes preload /lib/libsetlbf.so (procd's helper for services that log their output); without a firmware image it could not be verified"
+	fi
 
 	# something mounted over a system directory
 	awk '$2 ~ /^\/(bin|sbin|lib|lib64|usr|www)(\/|$)/ { print "/proc/mounts: " $1 " mounted on " $2 " (" $3 ")" }' /proc/mounts 2>/dev/null |
@@ -455,18 +544,29 @@ au_integrity() {
 # ---------------------------------------------------------------- persistence
 au_persistence() {
 	fo_persist >"$AU/ps"
+	au_fbconf
 	_ev='{ x = $10 (($11 != "-") ? " -> " $11 : "") ": " $8 " bytes, mode " $5 ", mtime " $9; if ($3 != "-") x = x "; " $3; x = x "; " (($12 == "-") ? "no package owns it" : "package " $12 " (" $13 ")"); print x }'
 	if fx_rom_ok; then
-		awk -F'\t' '$2 == "changed" && ($1 == "init" || $1 == "hotplug" || $1 == "inittab" || $1 == "rpcd" || $1 == "luci") && $13 !~ /^upgraded/ '"$_ev" "$AU/ps" |
-			au_add high persistence.image_script_changed "high: content compared with the firmware image" \
-				"Startup scripts of the firmware image were modified" \
-				"These scripts run as root at boot or on events, and they differ from the image although no package upgrade accounts for it. Appending a line to an existing init script is a well-known way to hide a backdoor." \
-				"Read each one (persistence shows the active lines, read_file the whole file) and compare with the image copy under $MCP_ROM. If you did not edit it, treat the router as compromised."
-		awk -F'\t' '$2 == "new" && $13 != "added" && $1 != "cron" && $1 != "rc_local" && $1 != "preload" && $1 != "ssh_keys" && $1 != "hosts" && $1 != "sysupgrade" && $1 != "feeds" && $1 != "modules" && !($10 ~ /^\/etc\/rc\.d\// && $11 ~ /^\.\.\/init\.d\/[^\/]+$/) '"$_ev" "$AU/ps" |
+		awk -F'\t' '$2 == "changed" && ($1 == "init" || $1 == "hotplug" || $1 == "inittab" || $1 == "rpcd" || $1 == "luci") && $13 !~ /^upgraded/ && $14 != "firstboot" '"$_ev" "$AU/ps" |
+			au_add high persistence.image_script_changed "high: content compared with the firmware image, and neither written at first boot nor explained by a package upgrade" \
+				"Startup scripts of the firmware image were changed after first boot" \
+				"These scripts run as root at boot or on events, and someone or something edited them after the firmware set itself up. That is legitimate if you edited them yourself; appending a line to an existing init script is also a well-known way to hide a backdoor." \
+				"Read each one (persistence shows the active lines, read_file the whole file) and compare with the image copy under $MCP_ROM. Only if a change is not yours, treat it as a compromise."
+		awk -F'\t' '$2 == "new" && $13 != "added" && $14 != "firstboot" && $1 != "cron" && $1 != "rc_local" && $1 != "preload" && $1 != "ssh_keys" && $1 != "hosts" && $1 != "sysupgrade" && $1 != "feeds" && $1 != "modules" && $1 != "dnsmasq" && !($1 == "firewall" && $10 ~ /\.nft$/) && !($10 ~ /^\/etc\/rc\.d\// && $11 ~ /^\.\.\/init\.d\/[^\/]+$/) '"$_ev" "$AU/ps" |
 			au_add medium persistence.autostart_added "medium: not in the image and in no package file list; a script you added yourself looks the same" \
 				"Autostart entries that neither the image nor a package provides" \
 				"Each listed file runs by itself: at boot, on a network or button event, at login or at a firewall reload. That is how something survives a reboot." \
 				"Read each one (the persistence tool shows the content). Delete what you did not put there and look for what it starts."
+		awk -F'\t' '$2 == "new" && $13 != "added" && $14 != "firstboot" && $1 == "firewall" && $10 ~ /\.nft$/ '"$_ev" "$AU/ps" |
+			au_add low persistence.firewall_rules_added "medium: not in the image and in no package file list; services of vendor firmware generate such files too" \
+				"nftables rule files that neither the image nor a package provides" \
+				"These files are loaded into the firewall at every reload. They cannot run programs, but they can open ports or redirect traffic." \
+				"Read each one (read_file) and check that the rules are wanted."
+		awk -F'\t' '($2 == "changed" || $2 == "new") && $13 != "added" && $14 == "firstboot" && $1 != "ssh_keys" && $1 != "hosts" && $1 != "sysupgrade" && $1 != "feeds" && $1 != "modules" && $1 != "dnsmasq" && $1 != "cron" && !($10 ~ /^\/etc\/rc\.d\// && $11 ~ /^\.\.\/init\.d\/[^\/]+$/) { print $10 ": " (($2 == "new") ? "created" : "changed") " by the firmware at first boot, mtime " $9 }' "$AU/ps" |
+			au_add info persistence.first_boot_changes "medium: $AU_FBCONF" \
+				"Startup scripts that the firmware itself wrote at first boot" \
+				"The first-boot scripts of the firmware rewrite some of its own startup scripts. They differ from the image without anyone having touched the router." \
+				"Nothing. The persistence tool shows their content."
 		awk -F'\t' '$2 == "new" && $13 == "added" && $1 != "ssh_keys" { n[$12]++ } END { for (p in n) print "package " p ": " n[p] " autostart files" }' "$AU/ps" |
 			au_add info persistence.package_autostart "medium: the package database is writable, so ownership can be forged" \
 				"Autostart entries of packages installed after flashing" \
@@ -478,10 +578,34 @@ au_persistence() {
 				"Feeds and keys decide where software comes from and whom the router trusts. Mirrors are a common, harmless change; an unknown feed or key is a supply-chain path." \
 				"Check the URLs and keys (persistence locations=[\"feeds\"])."
 	else
-		au_skip "persistence.image_script_changed, persistence.autostart_added, persistence.package_autostart, persistence.feeds_changed" "no usable firmware image at $MCP_ROM, new and changed entries cannot be told from shipped ones (the persistence tool lists them all)"
+		au_skip "persistence.image_script_changed, persistence.autostart_added, persistence.firewall_rules_added, persistence.package_autostart, persistence.feeds_changed" "no usable firmware image at $MCP_ROM, new and changed entries cannot be told from shipped ones (the persistence tool lists them all)"
 	fi
-	# entries the owner may have written: cron, rc.local, changed profile and hooks
-	awk -F'\t' '$4 == "f" && ($1 == "cron" || ($1 == "rc_local" && $2 != "same") || (($1 == "profile" || $1 == "firewall" || $1 == "dnsmasq") && $2 == "changed")) { print $10 }' "$AU/ps" |
+	# dnsmasq: only the directives that run a program make a file an autostart entry
+	# (server=, ipset= and address= lines do not), and only when the program is not an
+	# unchanged part of the image
+	{
+		awk -F'\t' '$1 == "dnsmasq" && $4 == "f" && $2 != "same" { print $10 }' "$AU/ps" |
+			while IFS= read -r _p; do
+				fx_refuse "$_p" >/dev/null && continue
+				rd "$_p" | tr -d '\000\r' | FX_P="$_p" awk '/^[ \t]*(dhcp-script|dhcp-luascript|conf-script)[ \t]*=/ {
+					t = $0; sub(/^[^=]*=[ \t]*/, "", t); sub(/[ \t]+$/, "", t)
+					print t "\t" ENVIRON["FX_P"] " line " NR ": " $0 }'
+			done
+		fo_uci dhcp | sed -n "s/^\(dhcp\.[^.]*\.dhcpscript\)='\(.*\)'\$/\2\t\1='\2' (uci dhcp)/p"
+	} >"$AU/dh" 2>/dev/null
+	while IFS="$FX_TAB" read -r _t _line; do
+		if fx_rom_ok && [ -f "$_t" ] && [ -f "$(rom_path "$_t")" ] && [ "$(fx_sum sha256 "$_t")" = "$(fx_sum sha256 "$(rom_path "$_t")")" ]; then
+			continue
+		fi
+		printf '%s\n' "$_line"
+	done <"$AU/dh" |
+		au_add medium persistence.dnsmasq_hook "medium: the directive is there; the program it names is not an unchanged file of the image" \
+			"dnsmasq is told to run a program" \
+			"dhcp-script, dhcp-luascript and conf-script make dnsmasq start a program, as root, on every DHCP lease or at start. Statistics tools use that; so does malware that wants to run without an init script." \
+			"Read the named program (read_file). Remove the directive if you did not add it."
+	# entries the owner may have written: cron, rc.local, changed profile and firewall
+	# scripts. cron.update is crond's own marker file, not a crontab.
+	awk -F'\t' '$4 == "f" && $10 != "/etc/crontabs/cron.update" && ($1 == "cron" || ($1 == "rc_local" && $2 != "same") || (($1 == "profile" || $1 == "firewall") && $2 == "changed")) { print $10 }' "$AU/ps" |
 		while IFS= read -r _p; do
 			fx_refuse "$_p" >/dev/null && continue
 			rd "$_p" | tr -d '\000\r' | redact | fx_redact_kv "$_p" | FX_P="$_p" awk '
