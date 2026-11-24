@@ -648,7 +648,8 @@ names containing `password`, `passwd`, `pwd`, `passphrase`, `passcode`, `secret`
 `token`, `sid` as a word; `pin`, `puk`, `pin_code`, `puk_code`. Not masked: `public_key`
 and booleans (`presharedkey_enable`). Inside longer strings (a WireGuard or OpenVPN client config)
 `PrivateKey = ` and `PresharedKey = ` values and PEM private key blocks (`<redacted
-private key>`) are masked. The core `redact` runs after that. A client config with its
+private key>`) are masked, and so are the members with such names in JSON text that
+sits inside a string (`\"password\":\"...\"`). The core `redact` runs after that. A client config with its
 keys can therefore only be fetched with `--no-redact` or in the web interface. The
 params of a call are never printed back.
 

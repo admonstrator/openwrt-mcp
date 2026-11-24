@@ -591,8 +591,15 @@ class TestCalls(OpenWrtTestCase):
             "pins": ["keep-me"], "public_key": "PUBLICKEYISFINE=", "private_key": WG_PRIVATE,
             "presharedkey": WG_PSK, "presharedkey_enable": True, "puk_code": "12345678", "pin_counter": 3,
             "config": conf, "cert": PEM + "trailer", "open_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIabcdefSECRETBODY",
+            # JSON text inside a string, as a backend may pass it through
+            "raw": json.dumps({"ssid": "Inner", "password": 'in"ner-pw', "pin": 9731, "public_key": "INNERPUB=",
+                               "wg": {"private_key": "INNERPRIV="}}),
             "last": "end"}})
         text = self.tool_ok("glinet_api", env=GL_ENV, object="wifi", method="get_config")
+        for secret in ("ner-pw", "9731", "INNERPRIV="):
+            self.assertNotIn(secret, text)
+        for kept in (r'\"ssid\": \"Inner\"', r'\"public_key\": \"INNERPUB=\"', r'\"password\":\"<redacted>\"'):
+            self.assertIn(kept, text)
         for secret in (WIFI_KEY, "482913", "SESSIONID42", "TOKENTOKEN", "pw-in-object", "pw-in-array", WG_PRIVATE, WG_PSK,
                        "12345678", "MIIEvQIBADANBg", "BKcwggSjAgEA", "MIIabcdefSECRETBODY", WG_PRIVATE[:12], WG_PSK[:12]):
             self.assertNotIn(secret, text)

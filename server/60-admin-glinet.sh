@@ -161,6 +161,18 @@ _ga_mask() {
 		}
 		return out s
 	}
+	# a line whose string value is itself JSON text (\"name\":\"value\"): the same
+	# line with the values of secret names masked
+	function nested(s,   out, m, nm, c) {
+		out = ""
+		while (match(s, /\\"[A-Za-z0-9_-]+\\"[ ]*:[ ]*(\\"(\\\\\\"|\\[^"]|[^"\\])*\\"|-?[0-9][0-9.]*)/)) {
+			m = substr(s, RSTART, RLENGTH)
+			nm = m; sub(/^\\"/, "", nm); sub(/\\".*/, "", nm)
+			if (secret(nm)) { c = index(m, ":"); m = substr(m, 1, c) "\\\"<redacted>\\\"" }
+			out = out substr(s, 1, RSTART - 1) m; s = substr(s, RSTART + RLENGTH)
+		}
+		return out s
+	}
 	skip {
 		# inside the object or array of a masked member: its closing line ends it
 		match($0, /^[ \t]*/)
@@ -184,6 +196,7 @@ _ga_mask() {
 			}
 		}
 		if (line ~ /PrivateKey|PresharedKey|-----BEGIN /) line = inner(line)
+		if (index(line, "\\\"") > 0) line = nested(line)
 		print line
 	}'
 }
