@@ -71,7 +71,7 @@ lib_sockets() {
 		inode = $6
 		pid = (inode in owner) ? owner[inode] : "-"
 		comm = "-"
-		if (pid != "-") { f = "/proc/" pid "/comm"; if ((getline comm < f) <= 0) comm = "-"; close(f) }
+		if (pid != "-") { f = "/proc/" pid "/comm"; if ((getline comm < f) <= 0) comm = "-"; close(f); gsub(/[\001-\037\177]/, "?", comm) }
 		print proto, state, la, hex(l[2]), ra, hex(r[2]), inode, pid, comm
 	}'
 }
@@ -98,12 +98,15 @@ lib_procs() {
 			s = substr($0, i + 7); j = index(s, "/exe -> "); if (!j) next
 			printf "E\t%s\t%s\n", substr(s, 1, j - 1), substr(s, j + 8) }'
 		grep -H -E '^(Uid|VmRSS):' /proc/[0-9]*/status 2>/dev/null
+		# stat and cmdline per process with control characters replaced: a comm or an
+		# argument holding a newline or tab cannot split or forge a record
 		for _d in /proc/[0-9]*; do
 			printf 'C\t%s\t' "${_d#/proc/}"
-			tr '\000\t\n' '   ' <"$_d/cmdline" 2>/dev/null
+			tr '\000-\037\177' ' ' <"$_d/cmdline" 2>/dev/null
+			printf '\nS\t%s\t' "${_d#/proc/}"
+			tr '\000-\037\177' '?' <"$_d/stat" 2>/dev/null
 			echo
 		done
-		cat /proc/[0-9]*/stat 2>/dev/null
 	} | awk -F '\t' '
 	$1 == "B" { btime = $2; next }
 	$1 == "E" { exe[$2] = $3; next }
@@ -114,9 +117,10 @@ lib_procs() {
 		else { v = $0; sub(/^.*VmRSS:[ \t]*/, "", v); sub(/ .*/, "", v); rss[pid] = v }
 		next
 	}
-	/^[0-9]+ \(/ {
-		line = $0
-		pid = substr(line, 1, index(line, " ") - 1)
+	$1 == "S" {
+		line = $3; sub(/\?+$/, "", line)
+		pid = $2
+		if (substr(line, 1, length(pid) + 2) != pid " (") next
 		# comm may contain spaces and parentheses: it ends at the last ")"
 		o = index(line, "("); r = 0
 		for (i = length(line); i > o; i--) if (substr(line, i, 1) == ")") { r = i; break }
@@ -150,21 +154,37 @@ lib_fd_inodes() {
 }
 
 # lib_rom_ok: exit status 0 when MCP_ROM looks like a firmware image root that files
-# can be compared against (squashfs /rom on a real router). Containers, ext4 and
+# can be compared against (squashfs /rom on a real router): it has etc/, bin/, usr/ or
+# lib/. Containers, ext4 and
 # initramfs images have none; callers then skip "not in firmware image" flags instead
 # of flagging every file.
 lib_rom_ok() {
-	[ -d "$MCP_ROM/etc" ] && { [ -d "$MCP_ROM/bin" ] || [ -d "$MCP_ROM/usr" ]; }
+	[ -d "$MCP_ROM/etc" ] || [ -d "$MCP_ROM/bin" ] || [ -d "$MCP_ROM/usr" ] || [ -d "$MCP_ROM/lib" ]
 }
 
-# lib_upper: print the overlay upper directory, or nothing when there is none.
-# MCP_UPPER first; some GL.iNet models keep it in /userdata/overlay/upper.
+# lib_upper: print the overlay upper directory; print nothing and fail when there is
+# none. MCP_UPPER when it exists; with the default MCP_UPPER also the upperdir of an
+# overlay root mount, then /userdata/overlay/upper (some GL.iNet models).
 lib_upper() {
 	if [ -d "$MCP_UPPER" ]; then
 		printf '%s\n' "${MCP_UPPER%/}"
-	elif [ -d /userdata/overlay/upper ]; then
-		printf '%s\n' /userdata/overlay/upper
+		return 0
 	fi
+	# an explicit MCP_UPPER that does not exist means "no overlay"; only the default
+	# value falls back to the root mount's upperdir and the GL.iNet location
+	[ "$MCP_UPPER" = /overlay/upper ] || return 1
+	_lu=$(awk '$2 == "/" && $3 == "overlay" {
+		n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^upperdir=/) u = substr(o[i], 10)
+	} END { print u }' /proc/mounts 2>/dev/null)
+	if [ -n "$_lu" ] && [ -d "$_lu" ]; then
+		printf '%s\n' "${_lu%/}"
+		return 0
+	fi
+	if [ -d /userdata/overlay/upper ]; then
+		echo /userdata/overlay/upper
+		return 0
+	fi
+	return 1
 }
 
 # lib_ubus OBJECT METHOD [JSON]: ubus call with a 10 s limit; non-zero when ubus is

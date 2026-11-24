@@ -104,7 +104,7 @@ tool_system_info() {
 			else l = "unknown (no / in /proc/mounts)"
 			printf "%-16s %s\n", "layout", l
 		}'
-	if lib_rom_ok; then _inv_kv "firmware image" "$MCP_ROM (usable for comparisons)"; else _inv_kv "firmware image" "$MCP_ROM not usable (no etc/ and bin/ or usr/ there): not-in-image flags are skipped"; fi
+	if lib_rom_ok; then _inv_kv "firmware image" "$MCP_ROM (usable for comparisons)"; else _inv_kv "firmware image" "$MCP_ROM not usable (no etc/, bin/, usr/ or lib/ there): not-in-image flags are skipped"; fi
 	_up=$(lib_upper)
 	_inv_kv "overlay upper" "${_up:-none found ($MCP_UPPER, /userdata/overlay/upper)}"
 	_inv_kv "trusted tools" "$MCP_TRUSTED"
@@ -251,7 +251,7 @@ tool_processes() {
 			if ("exec-mapping-in-tmp" in fl) print "exec-mapping-in-tmp executable code mapped from /tmp, /var or /dev/shm"
 			if ("exec-memfd-mapping" in fl) print "exec-memfd-mapping executable code mapped from an anonymous memory file"
 		}
-	}' passwd.txt ovl.txt maps.txt procs.tsv
+	}' passwd.txt ovl.txt maps.txt procs.tsv | redact
 }
 
 _inv_proc_detail() { # PID
@@ -277,7 +277,20 @@ _inv_proc_detail() { # PID
 	done
 
 	section "Command line (one argument per line)"
-	tr '\000' '\n' <"$_d/cmdline" 2>/dev/null | awk '{ printf "argv[%d] %s\n", NR - 1, $0 } END { if (NR == 0) print "(empty: kernel thread or zombie)" }'
+	# a value after password/secret/key-style arguments is masked here, one argument per
+	# line being out of reach for redact's command-line rule
+	tr '\000' '\n' <"$_d/cmdline" 2>/dev/null | awk -v red="$MCP_REDACT" '
+	{
+		a = $0
+		if (red == 1) {
+			la = tolower(a)
+			if (maskn) { a = "<redacted>"; maskn = 0 }
+			else if (match(la, /^-*(password|passwd|pass|secret|psk|key|token|pin)=/)) a = substr(a, 1, RLENGTH) "<redacted>"
+			else if (la ~ /^-*(password|passwd|pass|secret|psk|key|token)$/) maskn = 1
+		}
+		printf "argv[%d] %s\n", NR - 1, a
+	}
+	END { if (NR == 0) print "(empty: kernel thread or zombie)" }' | redact
 
 	section "Open files (fd -> target)"
 	# shellcheck disable=SC2012
@@ -328,12 +341,14 @@ tool_services() {
 	arg _filter filter ""
 	_romok=0
 	lib_rom_ok && _romok=1
-	# init scripts: name, then the daemon paths their procd_set_param command lines name
+	# init scripts: name, then the daemon paths their procd_set_param command lines name.
+	# Every content line gets a "|" in front, so a script cannot forge the "#@" control
+	# lines; control characters in file names become "?".
 	for _f in /etc/init.d/*; do
 		[ -f "$_f" ] || continue
-		printf '#@FILE %s\n' "${_f##*/}"
+		printf '#@FILE %s\n' "$(printf '%s' "${_f##*/}" | tr '\000-\037\177' '?')"
 		[ "$_romok" = 1 ] && { in_rom "$_f" && echo '#@ROM 1' || echo '#@ROM 0'; }
-		rd "$_f" | head -n 3000
+		rd "$_f" | head -n 3000 | sed 's/^/|/'
 	done >scripts.txt
 	# shellcheck disable=SC2012
 	ls -l /etc/rc.d/ 2>/dev/null | awk 'NF >= 9 { n = $9; for (i = 10; i <= NF; i++) n = n " " $i; if (n != "") print substr($1, 1, 1) "\t" n }' >rcd.txt
@@ -359,9 +374,12 @@ tool_services() {
 	FILTER=$_filter ROMOK=$_romok SRC=$_src awk -F '\t' '
 	function base(p) { sub(/ \(deleted\)$/, "", p); sub(/.*\//, "", p); return p }
 	FILENAME == "scripts.txt" {
-		if (substr($0, 1, 7) == "#@FILE ") { cur = substr($0, 8); names[++ns] = cur; delete var; next }
-		if (substr($0, 1, 6) == "#@ROM ") { rom[cur] = substr($0, 7); next }
-		line = $0; sub(/^[ \t]+/, "", line)
+		if (substr($0, 1, 1) != "|") {
+			if (substr($0, 1, 7) == "#@FILE ") { cur = substr($0, 8); names[++ns] = cur; delete var }
+			else if (substr($0, 1, 6) == "#@ROM ") rom[cur] = substr($0, 7)
+			next
+		}
+		line = substr($0, 2); sub(/^[ \t]+/, "", line)
 		if (match(line, /^[A-Za-z_][A-Za-z0-9_]*=/)) { vn = substr(line, 1, RLENGTH - 1); vv = substr(line, RLENGTH + 1); gsub(/["'"'"']/, "", vv); sub(/[ \t;].*/, "", vv); var[vn] = vv }
 		if (line ~ /^START=/) { v = line; sub(/^START=/, "", v); start[cur] = v }
 		if (line ~ /^USE_PROCD=1/) procd[cur] = 1
@@ -446,7 +464,7 @@ tool_services() {
 				printf "  %-14s running=%-5s pid=%-7s %s\n", in_, irun[s, in_], ((s, in_) in ipid ? ipid[s, in_] : "-"), icmd[s, in_]
 			}
 		}
-	}' scripts.txt rcd.txt procs.tsv svc.txt
+	}' scripts.txt rcd.txt procs.tsv svc.txt | redact
 }
 
 # ============================================================== packages
@@ -545,8 +563,10 @@ tool_packages() {
 		_n=0
 		while read -r _path _hash _pkg; do
 			_n=$((_n + 1))
-			if [ ! -f "$_path" ]; then printf '%-40s %-9s %s\n' "$_path" missing "$_pkg"; continue; fi
-			case ${#_hash} in 32) _cur=$(md5sum "$_path" 2>/dev/null) ;; *) _cur=$(sha256sum "$_path" 2>/dev/null) ;; esac
+			if [ ! -e "$_path" ] && [ ! -L "$_path" ]; then printf '%-40s %-9s %s\n' "$_path" missing "$_pkg"; continue; fi
+			# rd refuses FIFOs, devices and links into /proc, /sys, /dev
+			if ! rd "$_path" >conf.cur; then printf '%-40s %-9s %s\n' "$_path" unreadable "$_pkg"; continue; fi
+			case ${#_hash} in 32) _cur=$(md5sum <conf.cur) ;; *) _cur=$(sha256sum <conf.cur) ;; esac
 			[ "${_cur%% *}" = "$_hash" ] || printf '%-40s %-9s %s\n' "$_path" changed "$_pkg"
 		done <conf.txt >changed.txt
 		if [ -s changed.txt ]; then
@@ -555,10 +575,10 @@ tool_packages() {
 		else
 			echo "none"
 		fi
-		echo "($(wc -l <conf.txt) config files checked against the hashes in /usr/lib/opkg/status; changed config is normal after setup)"
+		echo "($(wc -l <conf.txt) config files checked against the hashes in /usr/lib/opkg/status; changed config is normal after setup; unreadable = not a regular file, or a link into /proc, /sys or /dev)"
 	else
 		if have apk; then
-			run_timeout 30 apk audit --no-network >audit.txt 2>&1
+			run_timeout 30 apk audit --no-network --no-cache >audit.txt 2>&1
 			_rc=$?
 			if [ "$_rc" = 0 ]; then
 				if [ -s audit.txt ]; then head -n 500 audit.txt; else echo none; fi
@@ -578,7 +598,7 @@ tool_packages() {
 		if [ "$_pm" = opkg ]; then
 			echo "opkg keeps hashes only for config files (above), not for programs and libraries, so a file audit is not possible with opkg. Files changed after flashing show up in the overlay; compare against the firmware image with the forensics tools (overlay_diff)."
 		elif have apk; then
-			run_timeout 90 apk audit --system --no-network >audit.txt 2>&1
+			run_timeout 90 apk audit --system --no-network --no-cache >audit.txt 2>&1
 			_rc=$?
 			if [ "$_rc" = 0 ]; then
 				if [ -s audit.txt ]; then head -n 1000 audit.txt; else echo "none: every package file matches the database"; fi
@@ -714,7 +734,7 @@ tool_kernel_modules() {
 		if [ ! -r /proc/modules ]; then
 			echo "/proc/modules: not available (kernel without module support?)"
 		else
-			ROMOK=$_romok awk '
+			ROMOK=$_romok MD=$_md HAVEMD=$([ -d "$_md" ] && echo 1 || echo 0) awk '
 			FILENAME == "ko.txt" { b = $0; sub(/.*\//, "", b); sub(/\.ko$/, "", b); gsub(/-/, "_", b); ko[b] = $0; next }
 			FILENAME == "romko.txt" { rom[$0] = 1; next }
 			{
@@ -723,7 +743,7 @@ tool_kernel_modules() {
 				note = ""
 				if ($1 in ko) {
 					if (ENVIRON["ROMOK"] == 1 && !(ko[$1] in rom)) note = "!! " ko[$1] " not in firmware image"
-				} else note = "no .ko on disk (built in, or loaded from elsewhere)"
+				} else if (ENVIRON["HAVEMD"] == 1) note = "!! no .ko file under " ENVIRON["MD"] ": loaded from elsewhere (e.g. /tmp) or deleted after loading"
 				line[n] = sprintf("%-24s %9s %4s %-6s %-8s %-28s %s", $1, $2, $3, taint, $5, users, note)
 			}
 			END {
@@ -746,12 +766,11 @@ tool_kernel_modules() {
 		[ "$_any" = 1 ] || echo "none"
 	} >boot.txt
 
-	section "Flagged (not in the firmware image)"
-	if [ "$_romok" = 1 ]; then
-		grep -h '!!' mods.txt boot.txt || echo "none"
-	else
-		echo "not checked: firmware image at $MCP_ROM not usable"
-	fi
+	section "Flagged (module file missing or not in the firmware image)"
+	grep -h '!!' mods.txt boot.txt || echo "none"
+	[ "$_romok" = 1 ] || echo "(firmware image at $MCP_ROM not usable: files are not compared with it)"
+	[ -d "$_md" ] || echo "(no $_md: .ko files cannot be checked)"
+	echo "(/proc/modules lists only loadable modules, never code built into the kernel; a loaded module whose .ko is missing is worth a look)"
 	cat mods.txt boot.txt
 	return 0
 }

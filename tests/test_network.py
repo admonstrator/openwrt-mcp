@@ -253,7 +253,7 @@ class TestFirewall(OpenWrtTestCase):
     def test_ruleset_not_available_says_why(self):
         text = self.tool_ok("firewall")
         # the containers cannot open netlink for nft; iptables-save prints nothing
-        self.assertRegex(text, r"(cannot read the ruleset \(exit \d+\)|\(empty: no rules loaded)")
+        self.assertRegex(text, r"(cannot read the ruleset \(exit \d+\)|\(empty: no rules loaded|no iptables tables loaded)")
 
     @needs_container
     def test_opened_ports_and_custom_files(self):
@@ -305,6 +305,27 @@ mkdir -p /var/run && echo 'TCP:51413:192.168.8.30:51413:1795600000:torrent' > /v
     def test_raw(self):
         text = self.tool_ok("firewall", raw=True)
         self.assertNotIn("raw=true prints all", text)
+
+
+
+class TestReviewFixesNetwork(OpenWrtTestCase):
+    @needs_container
+    def test_i7_iptables_save_only_with_tables(self):
+        write_file(self, "/fixture/bin/iptables-save", "#!/bin/sh\ntouch /tmp/ipt-called\necho '*filter'", mode="755")
+        write_file(self, "/fixture/bin/ip6tables-save", "#!/bin/sh\ntouch /tmp/ip6t-called\necho '*filter'", mode="755")
+        self.sh("rm -f /tmp/ipt-called /tmp/ip6t-called")
+        v4 = self.sh("grep -c . /proc/net/ip_tables_names 2>/dev/null || true").strip() or "0"
+        v6 = self.sh("grep -c . /proc/net/ip6_tables_names 2>/dev/null || true").strip() or "0"
+        text = self.tool_ok("firewall", env={"PATH": FAKE_PATH})
+        if v4 == "0":
+            self.assertIn("iptables-save: no iptables tables loaded", text)
+            self.assertEqual(self.sh("[ -e /tmp/ipt-called ] && echo yes || echo no").strip(), "no")
+        if v6 == "0":
+            self.assertIn("ip6tables-save: no ip6tables tables loaded", text)
+            self.assertEqual(self.sh("[ -e /tmp/ip6t-called ] && echo yes || echo no").strip(), "no")
+        if v4 == "0" and v6 == "0":
+            return
+        self.assertIn("*filter", text)
 
 
 if __name__ == "__main__":

@@ -153,7 +153,7 @@ All tools are read-only and take their data from `/proc`, `/sys`, files and the 
 programs `ubus`, `uci`, `logread`, `dmesg`, `ip`, `iwinfo`, `wg`, `nft`, `iptables-save`,
 `opkg`/`apk`. A missing source is reported as "not available" with the reason. Flags that
 compare against the firmware image ("not in firmware image") are only set when `MCP_ROM`
-looks like a firmware root (`lib_rom_ok`: has `etc/` and `bin/` or `usr/`); containers,
+looks like a firmware root (`lib_rom_ok`: has `etc/`, `bin/`, `usr/` or `lib/`); containers,
 ext4 and initramfs images get a note instead of a flag on every file.
 
 | Tool | Arguments (default) | Reads |
@@ -194,12 +194,17 @@ Details and limits:
   (later than 10 minutes after it counts as user-installed, a heuristic); apk cannot tell
   and marks packages named in `/etc/apk/world` as REQ. Changed config files: opkg's
   `Conffiles` hashes are recomputed directly (`opkg list-changed-conffiles` would write a
-  lock file); apk uses `apk audit`. `audit=true` runs `apk audit --system` (package files
+  lock file); a conffile that is not a regular file or links into /proc, /sys or /dev is
+  reported as `unreadable` and never opened. apk uses `apk audit --no-cache` (without
+  `--no-cache` apk creates `/tmp/cache/apk`). `audit=true` runs `apk audit --system` (package files
   whose content changed); opkg has no file hashes and says so.
 - `logs` passes every line through `redact`. `file` must resolve to a file under
   `/tmp/log` or `/var/log`.
 - `kernel_modules` prints the taint and a "Flagged" section first, then the module
-  list and the boot lists. It flags a loaded module whose `.ko` under `/lib/modules/<release>` is
+  list and the boot lists. `/proc/modules` lists only loadable modules, so a loaded
+  module without a `.ko` under `/lib/modules/<release>` is flagged (loaded from elsewhere
+  or deleted after loading); when that directory does not exist at all (containers) the
+  check is skipped with a note. It also flags a loaded module whose `.ko` under `/lib/modules/<release>` is
   not in the image, and `/etc/modules.d` entries not in the image. Taint bits are decoded;
   `O` (out-of-tree) is normal on OpenWrt.
 - `uci` never sets or commits. `package` may be `pkg` or `pkg.section[.option]`.
@@ -224,15 +229,25 @@ Details and limits:
 - `firewall` prints what is exposed first (zones, forwardings, WAN-input accepts, port
   forwards, includes), then all rules, UPnP, custom rule files and the active ruleset.
   WAN zones are zones named `*wan*`, masquerading, or holding network
-  `wan`. "Rules accepting input from a WAN zone" are enabled or disabled `rule` sections
+  `wan`. `iptables-save`/`ip6tables-save` run only when `/proc/net/ip_tables_names`
+  (`ip6_tables_names`) lists tables: legacy iptables would otherwise load the table
+  modules. "Rules accepting input from a WAN zone" are enabled or disabled `rule` sections
   with a WAN `src`, no `dest` and target ACCEPT. The ruleset is capped at 300 lines per
   command unless `raw=true`.
 
 Helpers in `server/05-lib.sh` (for other modules): `lib_sockets` (unchanged format),
 `lib_procs` (TSV: pid ppid uid state rss_kb start kthread comm exe cmdline),
-`lib_fd_inodes` ("inode pid"), `lib_uci_dump PKG` (TSV `S sec type` / `O sec opt value`,
+`lib_fd_inodes` ("inode pid"); control characters in comm and cmdline are replaced
+(`?` in comm, space in cmdline), so a name with a newline cannot split a record, `lib_uci_dump PKG` (TSV `S sec type` / `O sec opt value`,
 not redacted), `lib_ubus OBJ METHOD` (only when the ubus socket exists, 10 s limit;
-redirect its output to a file), `lib_rom_ok`, `lib_upper`.
+redirect its output to a file), `lib_rom_ok`, `lib_upper` (MCP_UPPER when it exists;
+with the default MCP_UPPER also the upperdir of an overlay root mount, then
+`/userdata/overlay/upper`; prints nothing and fails when there is none).
+
+Command lines (process list and `pid` view, procd instances, daemon lines in `network`)
+pass through `redact`; the `pid` view also masks the argument after `password`,
+`secret`, `psk`, `key`, `token` style arguments and the value of `--password=...`
+style arguments itself.
 
 ## 4 Files, forensics and audit
 
