@@ -236,6 +236,9 @@ Details and limits:
   reported as `unreadable` and never opened. apk uses `apk audit --no-cache` (without
   `--no-cache` apk creates `/tmp/cache/apk`). `audit=true` runs `apk audit --system` (package files
   whose content changed); opkg has no file hashes and says so.
+  Order: changed config files first, then the package list with the packages that did
+  not come with the image on top, so a list cut by `max_results` or the output limit
+  loses only image packages.
 - `logs` passes every line through `redact`. `file` must resolve to a file under
   `/tmp/log` or `/var/log`.
 - `kernel_modules` prints the taint and a "Flagged" section first, then the module
