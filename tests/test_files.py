@@ -351,5 +351,78 @@ class TestFileHash(FilesFixture):
         self.assertTrue(err)
 
 
+class TestReviewFindings(FilesFixture):
+    """Round 3: what an independent review found in the file tools."""
+
+    def find(self, env=None, **args):
+        text, err = self.session(env).call_tool("find_files", args)
+        self.assertFalse(err, text)
+        return text
+
+    def test_only_the_servers_own_temp_dir_is_left_out(self):
+        # F3: /tmp/openwrt-mcp.<anything> used to be invisible, a ready hiding place
+        self.sh("mkdir -p /tmp/openwrt-mcp.evil && printf '#!/bin/sh\\nid\\n' > /tmp/openwrt-mcp.evil/run.sh && "
+                "chmod 755 /tmp/openwrt-mcp.evil/run.sh")
+        self.assertIn("/tmp/openwrt-mcp.evil/run.sh", self.find(ROM, name="run.sh"))
+        text = self.tool_ok("list_dir", ROM, path="/tmp", depth=2)
+        self.assertIn("/tmp/openwrt-mcp.evil/run.sh", text)
+        own = re.search(r"temp dir +(\S+)", self.tool_ok("server_info", ROM)).group(1)
+        self.assertNotIn(own + "/", text)
+
+    def test_hash_of_a_file_that_cannot_be_read_is_never_printed(self):
+        # F4: /proc/mounts got the SHA-256 of the empty input
+        empty = hashlib.sha256(b"").hexdigest()
+        text = self.tool_ok("file_hash", ROM, paths=["/proc/mounts", "/proc/version", "/fx/new.txt"])
+        self.assertNotIn(empty, text)
+        self.assertIn(hashlib.sha256(b"new\n").hexdigest(), text)
+        want = self.sh("sha256sum < /proc/version").split()[0]
+        self.assertIn(want, text)
+        text = self.tool_ok("file_hash", ROM, paths=["/proc/mounts"], algorithm="md5")
+        self.assertNotIn(hashlib.md5(b"").hexdigest(), text)
+
+    def test_fifo_in_the_package_database_does_not_hang(self):
+        # F5: find -name '*.list' without -type f fed a FIFO to awk
+        self.sh("mkdir -p /usr/lib/opkg/info && mkfifo /usr/lib/opkg/info/zz.list")
+        try:
+            text, err = self.tool("file_hash", ROM, timeout=40, paths=["/etc/hosts"])
+            self.assertFalse(err, text)
+            self.assertRegex(text, r"sha256 +[0-9a-f]{64}")
+        finally:
+            self.sh("rm -f /usr/lib/opkg/info/zz.list")
+
+    def test_fifo_in_place_of_a_system_file_does_not_hang(self):
+        # F5: /etc/group and /etc/passwd were read without a regular-file check
+        self.sh("mv /etc/group /etc/group.real && mkfifo /etc/group")
+        try:
+            text, err = self.tool("list_dir", ROM, timeout=40, path="/fx")
+            self.assertFalse(err, text)
+            self.assertIn("/fx/text.txt", text)
+        finally:
+            self.sh("rm -f /etc/group && mv /etc/group.real /etc/group")
+
+    def test_hex_view_without_hexdump_is_an_error(self):
+        # F10
+        self.sh("mv /usr/bin/hexdump /usr/bin/hexdump.off")
+        try:
+            text, err = self.tool("read_file", ROM, path="/fx/bin.dat", view="hex")
+            self.assertTrue(err, text)
+            self.assertIn("hexdump: not available", text)
+            self.assertNotIn("not found", text)
+        finally:
+            self.sh("mv /usr/bin/hexdump.off /usr/bin/hexdump")
+
+    def test_more_key_files_refuse_raw_views(self):
+        # F9: dropbear client keys, hostapd per-station PSKs, WireGuard key files
+        self.sh("mkdir -p /fx/etc/wireguard && printf 'KEY\\000\\001clientkeybytes\\000' > /fx/id_dropbear && "
+                "echo '00:11:22:33:44:55 stationpsk123' > /fx/hostapd-wl0.psk && "
+                "echo 'aGVsbG9oZWxsb2hlbGxvaGVsbG9oZWxsb2hlbGxvaGVsbG8=' > /fx/etc/wireguard/privatekey && "
+                "echo 'aGVsbG9oZWxsb2hlbGxvaGVsbG9oZWxsb2hlbGxvaGVsbG8=' > /fx/etc/wireguard/wg0.key")
+        for name in ("id_dropbear", "hostapd-wl0.psk", "etc/wireguard/privatekey", "etc/wireguard/wg0.key"):
+            for view in ("hex", "strings"):
+                text, err = self.tool("read_file", ROM, path=f"/fx/{name}", view=view, min_length=4)
+                self.assertTrue(err, f"{name} {view}: {text}")
+                self.assertIn("redaction is on", text)
+
+
 if __name__ == "__main__":
     unittest.main()

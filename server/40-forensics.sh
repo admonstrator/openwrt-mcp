@@ -39,6 +39,8 @@ function fo_expected(p) {
 		p ~ /^\/\.extroot/ || p ~ /^\/root\/\.ash_history$/ || p ~ /^\/etc\/ssl\/certs\//)
 }
 '
+FO_OVERLAY_MAX=20000
+FO_PERSIST_MAX=500
 FO_LOCS="cron rc_local init inittab hotplug uci_defaults firewall dnsmasq profile preload modules sysupgrade rpcd luci feeds hosts ssh_keys"
 
 # uci show PKG, or failure when uci is missing or the package does not exist.
@@ -57,12 +59,22 @@ fo_overlay() {
 	_ou=${1%/}
 	_os=$_ou$2/
 	[ "$2" = / ] && _os=$_ou/
+	rm -f "$MCP_TMP/overlay.cut"
 	[ -d "$_os" ] || return 0
-	find "$_os" -xdev -mindepth 1 -print0 2>/dev/null | fx_ls | head -n 20001 | fx_cmp "$_ou" 1 | fx_pkg | fx_firstboot "$_ou" |
-		FX_UP="$_ou" FX_ROM="${MCP_ROM%/}" awk -F'\t' "$FX_AWK_LS$FO_AWK_LOC"'
-		# a regular file that exists below ROOT (no process needed: getline fails on a missing file)
-		function isfile(root, p,   l, r) { r = (getline l < (root p)); close(root p); return (r >= 0) }
+	# at most FO_OVERLAY_MAX entries are scanned; a cut scan leaves $MCP_TMP/overlay.cut,
+	# and the callers say that the scan was cut
+	find "$_os" -xdev -mindepth 1 -print0 2>/dev/null | fx_ls |
+		awk -v max="$FO_OVERLAY_MAX" -v f="$MCP_TMP/overlay.cut" 'NR > max { print "cut" >f; exit } { print }' |
+		fx_cmp "$_ou" 1 | fx_pkg | fx_firstboot "$_ou" >"$MCP_TMP/overlay.scan"
+	# the image programs that new links point at: found with ls, never by opening a file
+	FX_ROM="${MCP_ROM%/}" awk -F'\t' "$FX_AWK_LS"'$1 == "new" && $3 == "l" { print ENVIRON["FX_ROM"] fx_resolve($9, $10) }' "$MCP_TMP/overlay.scan" |
+		tr '\n' '\0' | fx_ls | FX_ROM="${MCP_ROM%/}" awk "$FX_AWK_LS"'{ if (fx_ls($0) && F_type == "f") print substr(F_path, length(ENVIRON["FX_ROM"]) + 1) }' >"$MCP_TMP/overlay.romf"
+	FX_RF="$MCP_TMP/overlay.romf" awk -F'\t' "$FX_AWK_LS$FO_AWK_LOC"'
 		BEGIN { OFS = "\t" }
+		FILENAME == ENVIRON["FX_RF"] { romf[$0] = 1; next }
+		# first pass over the scan: every path the overlay holds
+		FNR == 1 { pass++ }
+		pass == 1 { up[$9] = 1; next }
 		{
 			st = $1; type = $3; mode = $4; size = $7; p = $9; pkg = $11; q = $12; fb = ($13 == "firstboot")
 			loc = fo_loc(p); code = fo_code(p); exec = (type == "f" && mode ~ /[1357]/ && substr(mode, 2) ~ /[1357]/)
@@ -112,7 +124,7 @@ fo_overlay() {
 				else if (q == "added") { prio = 4; why = "from package " pkg ", installed after flashing" }
 				else if (loc == "ssh_keys") { prio = 2; why = "authorized SSH keys added (see users_auth)" }
 				else if (p ~ /^\/etc\/rc\.d\// && $10 ~ /^\.\.\/init\.d\/[^\/]+$/) { prio = 4; why = "service enabled or disabled" }
-				else if (type == "l" && fo_code(t) && isfile(ENVIRON["FX_ROM"], t) && !isfile(ENVIRON["FX_UP"], t)) { prio = 4; why = "link to a program of the image (" t ")" }
+				else if (type == "l" && fo_code(t) && (t in romf) && !(t in up)) { prio = 4; why = "link to a program of the image (" t ")" }
 				else if (fb && (code || loc != "")) { prio = 4; why = "created by the firmware at first boot" }
 				else if (loc == "sysupgrade" || loc == "hosts" || loc == "feeds" || loc == "modules") { prio = 3; why = "added: " loc }
 				else if (loc != "") { prio = 2; why = "autostart entry not in the image (" loc "), no package owns it" }
@@ -122,7 +134,8 @@ fo_overlay() {
 				else { prio = 4; why = "added" }
 			}
 			print prio "\t" p, prio, status, why, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
-		}' | sort | cut -f3-
+		}' "$MCP_TMP/overlay.romf" "$MCP_TMP/overlay.scan" "$MCP_TMP/overlay.scan" | sort | cut -f3-
+	rm -f "$MCP_TMP/overlay.scan" "$MCP_TMP/overlay.romf"
 }
 
 # ---------------------------------------------------------------- overlay_diff
@@ -130,6 +143,7 @@ mcp_register overlay_diff <<'EOF'
 {"name":"overlay_diff","title":"Overlay against firmware image","description":"Lists everything the writable overlay adds, changes or deletes compared with the firmware image: per entry status, type, mode, owner, size, mtime, what the image has instead and which package owns the path. Entries are ordered by priority: 1 image programs replaced after first boot, setuid added, ld.so.preload; 2 new programs or autostart entries no package owns, deleted image files; 3 package upgrades, account files, mode changes, changed data files; 4 package installs, what the firmware wrote at first boot, other configuration; 5 expected state (/etc/config, host keys, package database). Use it to answer what differs from the shipped firmware; without an overlay (x86 ext4, initramfs) it says so.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Only entries below this absolute path, e.g. /usr/bin. Default /.","default":"/"},"status":{"type":"string","enum":["all","added","changed","deleted","unchanged"],"description":"Only entries with this status; changed includes mode and owner changes, unchanged are files copied up with identical content. Default all.","default":"all"},"max_priority":{"type":"integer","description":"Only entries of this priority or more urgent (1 = most urgent). Default 5 (everything).","default":5,"minimum":1,"maximum":5},"offset":{"type":"integer","description":"Entries to skip, for paging. Default 0.","default":0,"minimum":0},"max_results":{"type":"integer","description":"Entries to return. Default 200.","default":200,"minimum":1,"maximum":1000}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_overlay_diff() {
+	fx_names_env
 	fx_path p path / || return 1
 	arg status status all
 	case $status in all | added | changed | deleted | unchanged) ;; *) tool_error "status must be all, added, changed, deleted or unchanged, got '$status'"; return 1 ;; esac
@@ -168,12 +182,12 @@ tool_overlay_diff() {
 	if fbw=$(fx_fbwindow); then
 		echo "first boot: entries with mtime and ctime between ${fbw%%"$FX_TAB"*} and ${fbw#*"$FX_TAB"} (the hour after the newest file of the image's /etc, where the clock starts before NTP) count as written by the firmware itself; a forged system clock could place a file there."
 	fi
-	[ "$(wc -l <"$rec")" -gt 20000 ] && echo "note: more than 20000 overlay entries, the scan stopped there; pass path to scan a subtree"
+	[ -e "$MCP_TMP/overlay.cut" ] && echo "note: more than $FO_OVERLAY_MAX overlay entries, the scan stopped there and what follows is incomplete; pass path to scan a subtree"
 	echo
 	awk -F'\t' -v want="$status" -v maxp="$maxp" -v off="$off" -v max="$max" '
 		function names(   l, f) {
-			while ((getline l < "/etc/passwd") > 0) { split(l, f, ":"); if (!(f[3] in UN)) UN[f[3]] = f[1] }
-			while ((getline l < "/etc/group") > 0) { split(l, f, ":"); if (!(f[3] in GN)) GN[f[3]] = f[1] }
+			while ((getline l < ENVIRON["FX_PW"]) > 0) { split(l, f, ":"); if (!(f[3] in UN)) UN[f[3]] = f[1] }
+			while ((getline l < ENVIRON["FX_GR"]) > 0) { split(l, f, ":"); if (!(f[3] in GN)) GN[f[3]] = f[1] }
 		}
 		BEGIN { names() }
 		{
@@ -218,6 +232,7 @@ fo_persist() {
 		/usr/lib/lua/luci/controller /usr/share/luci/menu.d /usr/share/ucode/luci/controller /www/cgi-bin \
 		/etc/opkg.conf /etc/opkg /etc/apk/repositories /etc/apk/repositories.d /etc/apk/keys /etc/hosts
 	# hook files that only uci names: firewall includes and the dnsmasq dhcp-script
+	rm -f "$MCP_TMP/persist.cut"
 	{
 		fo_uci firewall | sed -n "s/^firewall\.[^.]*\.path='\(\/.*\)'\$/firewall\t\1/p"
 		fo_uci dhcp | sed -n "s/^dhcp\.[^.]*\.dhcpscript='\(\/.*\)'\$/dnsmasq\t\1/p"
@@ -226,7 +241,18 @@ fo_persist() {
 		find "$@" -maxdepth 4 ! -type d -print0 2>/dev/null
 		fo_keyfiles | tr '\n' '\0'
 		cut -f2 "$MCP_TMP/persist.extra" | tr '\n' '\0'
-	} | fx_ls | head -n 5000 | fx_cmp "" 1 | fx_pkg | fx_firstboot "" | FX_X="$MCP_TMP/persist.extra" awk -F'\t' "$FO_AWK_LOC"'
+	} | fx_ls | FX_X="$MCP_TMP/persist.extra" FX_CUT="$MCP_TMP/persist.cut" awk -v max="$FO_PERSIST_MAX" "$FX_AWK_LS$FO_AWK_LOC"'
+		# at most FO_PERSIST_MAX entries per location, so that a flood of files in one
+		# place cannot push the others out; the locations that were cut are written to
+		# $MCP_TMP/persist.cut and the callers say so
+		BEGIN { while ((getline x < ENVIRON["FX_X"]) > 0) { split(x, f, "\t"); extra[f[2]] = f[1] } }
+		{
+			if (!fx_ls($0)) next
+			l = fo_loc(F_path); if (l == "" && (F_path in extra)) l = extra[F_path]
+			if (l == "") next
+			if (++n[l] > max) { if (n[l] == max + 1) print l >ENVIRON["FX_CUT"]; next }
+			print
+		}' | fx_cmp "" 1 | fx_pkg | fx_firstboot "" | FX_X="$MCP_TMP/persist.extra" awk -F'\t' "$FO_AWK_LOC"'
 		BEGIN {
 			OFS = "\t"; split("'"$FO_LOCS"'", o, " "); for (i in o) ord[o[i]] = sprintf("%02d", i)
 			while ((getline x < ENVIRON["FX_X"]) > 0) { split(x, f, "\t"); extra[f[2]] = f[1] }
@@ -242,10 +268,10 @@ fo_persist() {
 fo_keyfiles() {
 	{
 		echo /etc/dropbear/authorized_keys
-		awk -F: '$6 != "" && $6 != "/" { print $6 "/.ssh/authorized_keys" }' /etc/passwd 2>/dev/null
+		awk -F: '$6 != "" && $6 != "/" { print $6 "/.ssh/authorized_keys" }' "$(fx_reg /etc/passwd)" 2>/dev/null
 		echo /root/.ssh/authorized_keys
 	} | awk '!seen[$0]++' | while IFS= read -r _kf; do
-		[ -f "$_kf" ] && printf '%s\n' "$_kf"
+		[ "$(fx_reg "$_kf")" != /dev/null ] && printf '%s\n' "$_kf"
 	done
 	return 0
 }
@@ -330,6 +356,9 @@ tool_persistence() {
 			case " $want " in *" $loc "*) ;; *) continue ;; esac
 		fi
 		section "$loc: $(fo_loc_title "$loc")"
+		if grep -qx "$loc" "$MCP_TMP/persist.cut" 2>/dev/null; then
+			echo "  note: more than $FO_PERSIST_MAX entries in $loc; only the first $FO_PERSIST_MAX were examined, the rest could hide an entry (list_dir and find_files show them all)"
+		fi
 		fo_loc_extra "$loc"
 		awk -F'\t' -v l="$loc" '$1 == l' "$rec" >"$rec.l"
 		if [ ! -s "$rec.l" ]; then
@@ -363,7 +392,18 @@ tool_persistence() {
 			if [ "$pkg" != - ]; then printf '; package %s, %s' "$pkg" "$qual"; else printf '; no package'; fi
 			[ "$fb" = firstboot ] && [ "$st" != same ] && printf '; written at first boot'
 			printf ')\n'
-			[ "$ty" = f ] || continue
+			# a link is shown through what it points at (fx_show refuses links into /proc,
+			# /sys and /dev); the rc.d links only enable an init script
+			case $ty$path in
+			f*) ;;
+			l/etc/rc.d/*) continue ;;
+			l*)
+				case $(readlink -f "$path" 2>/dev/null) in
+				/tmp/* | /var/* | /dev/shm/* | /run/*) echo "      !! a link to the RAM disk: the content can be swapped without touching the flash" ;;
+				esac
+				;;
+			*) continue ;;
+			esac
 			if [ "$class" = keys ]; then
 				printf '      %s key lines\n' "$(rd "$path" | grep -c '^[^#]')"
 			elif [ "$class" = scripts ] && [ "$qual" = added ]; then
@@ -383,7 +423,7 @@ tool_persistence() {
 				END { for (i = 1; i <= k; i++) printf "  %s, %s (%d):%s\n", lab[order[i]], order[i], n[order[i]], names[order[i]] }' "$rec.l"
 		fi
 	done
-	rm -f "$rec" "$rec.l"
+	rm -f "$rec" "$rec.l" "$MCP_TMP/persist.cut"
 	return 0
 }
 
@@ -392,10 +432,10 @@ tool_persistence() {
 #   name uid gid home shell pwstate changed flags
 # pwstate: EMPTY | none | locked | set:<algorithm>   flags: comma list or "-"
 fo_accounts() {
-	_ap=$(rom_path /etc/passwd)
-	[ -f "$_ap" ] || _ap=/dev/null
-	_as=/etc/shadow
+	_ap=$(fx_reg "$(rom_path /etc/passwd)")
+	_as=$(fx_reg /etc/shadow)
 	[ -r "$_as" ] || _as=/dev/null
+	_al=$(fx_reg /etc/passwd)
 	FX_S="$_as" FX_RP="$_ap" awk -F: '
 	function day2date(d,   z, era, doe, yoe, y, doy, mp, m, dd) {
 		z = d + 719468; era = int(z / 146097); doe = z - era * 146097
@@ -435,7 +475,7 @@ fo_accounts() {
 		if (src == "passwd" && st ~ /^set/) f = f ",hash-in-passwd"
 		if (hasrom && !($1 in rom)) f = f ",not-in-image"
 		print $1, $3, $4, ($6 == "") ? "-" : $6, ($7 == "") ? "-" : $7, st, c, (f == "") ? "-" : substr(f, 2)
-	}' "$_as" "$_ap" /etc/passwd 2>/dev/null
+	}' "$_as" "$_ap" "$_al" 2>/dev/null
 }
 
 # fo_keys: one line per authorized key, tab separated:
@@ -553,6 +593,13 @@ fo_dropbear() {
 		}'
 }
 
+# users_auth masks whatever the redaction setting is: nothing it prints needs the value.
+fo_mask() { (
+	# shellcheck disable=SC2034  # read by redact
+	MCP_REDACT=1
+	redact
+); }
+
 mcp_register users_auth <<'EOF'
 {"name":"users_auth","title":"Accounts and logins","description":"Shows who can log in and how: accounts with uid, shell and password state (empty, none, locked, or the hash algorithm, never the hash), accounts with uid 0 besides root, authorized SSH keys with type, size, comment and SHA256 fingerprint, the dropbear and OpenSSH settings (password login, root login, ports, interfaces) with the sockets they listen on, and the web login configuration of uhttpd, rpcd and LuCI (plus GL.iNet's web interface when present). Use it to check authentication; it never prints a secret, with or without redaction.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
@@ -613,7 +660,7 @@ tool_users_auth() {
 	section "Web interface and ubus logins"
 	if fo_uci uhttpd >"$MCP_TMP/ua.uci"; then
 		echo "uhttpd:"
-		grep -E '\.(listen_https?|no_ubusauth|rfc1918_filter|redirect_https|ubus_prefix|home|httpauth|realm|config)=|=httpauth$|\.(prefix|username)=' "$MCP_TMP/ua.uci" | redact | sed 's/^/  /'
+		grep -E '\.(listen_https?|no_ubusauth|rfc1918_filter|redirect_https|ubus_prefix|home|httpauth|realm|config)=|=httpauth$|\.(prefix|username)=' "$MCP_TMP/ua.uci" | fo_mask | sed 's/^/  /'
 		if grep -q "no_ubusauth='1'" "$MCP_TMP/ua.uci"; then echo "  WARNING: no_ubusauth=1, ubus over HTTP needs no login"; fi
 	elif [ -f /etc/config/uhttpd ]; then
 		echo "uhttpd: uci: not available, /etc/config/uhttpd not parsed"
@@ -655,7 +702,7 @@ tool_users_auth() {
 		for g in oui-httpd glconfig; do
 			if fo_uci "$g" >"$MCP_TMP/ua.uci"; then
 				echo "uci $g (login related options):"
-				grep -Ei 'passw|login|inited|init_status|lang|session|token' "$MCP_TMP/ua.uci" | redact | head -n 20 | sed 's/^/  /'
+				grep -Ei 'passw|login|inited|init_status|lang|session|token' "$MCP_TMP/ua.uci" | fo_mask | head -n 20 | sed 's/^/  /'
 			fi
 		done
 		rm -f "$MCP_TMP/ua.uci"

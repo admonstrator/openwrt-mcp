@@ -85,13 +85,18 @@ function fx_ls(line,   h, n, f, r, i) {
 '
 
 # awk library: fx_fmt() formats a record (see fx_cmp) as one aligned line.
-# Needs R_* variables set by fx_rec(); owner names come from /etc/passwd and /etc/group.
+# Needs R_* variables set by fx_rec(); owner names come from the files fx_names_env
+# checked (FX_PW, FX_GR), so call that before any awk that uses fx_names().
 FX_AWK_FMT='
 function fx_names(   l, f) {
-	while ((getline l < "/etc/passwd") > 0) { split(l, f, ":"); if (!(f[3] in UN)) UN[f[3]] = f[1] }
-	close("/etc/passwd")
-	while ((getline l < "/etc/group") > 0) { split(l, f, ":"); if (!(f[3] in GN)) GN[f[3]] = f[1] }
-	close("/etc/group")
+	if (ENVIRON["FX_PW"] != "") {
+		while ((getline l < ENVIRON["FX_PW"]) > 0) { split(l, f, ":"); if (!(f[3] in UN)) UN[f[3]] = f[1] }
+		close(ENVIRON["FX_PW"])
+	}
+	if (ENVIRON["FX_GR"] != "") {
+		while ((getline l < ENVIRON["FX_GR"]) > 0) { split(l, f, ":"); if (!(f[3] in GN)) GN[f[3]] = f[1] }
+		close(ENVIRON["FX_GR"])
+	}
 	SW["same"] = "same"; SW["changed"] = "CHANGED"; SW["meta"] = "meta"; SW["new"] = "new"
 	SW["noimage"] = "-"; SW["uncmp"] = "?"
 }
@@ -123,7 +128,48 @@ fx_sortk() {
 # watchdog of run_timeout keeps the pipe open and the reader would wait for it.
 fx_snap() { cat "$1" 2>/dev/null | head -c 1048576; }
 fx_find_ls() { find "$@" -print0 2>/dev/null | fx_ls | head -n 20001; }
-fx_sum() { rd "$2" | "${1}sum" | cut -d' ' -f1; }
+# fx_sum ALG PATH: the hash of PATH, or nothing and status 1 when PATH could not be
+# read. Never the hash of the empty input for a file that was refused: the read reports
+# its failure through a marker file, because a pipeline hides it. Kernel files are read
+# directly, as read_file does (rd refuses kernel links like /proc/mounts); callers rule
+# out the ones that block with fx_refuse.
+fx_sum() {
+	_sf=$MCP_TMP/sum.$$
+	rm -f "$_sf.bad"
+	{
+		case $2 in
+		/proc/* | /sys/*) cat "$2" 2>/dev/null ;;
+		*) rd "$2" ;;
+		esac || : >"$_sf.bad"
+	} | "${1}sum" | cut -d' ' -f1 >"$_sf.out"
+	if [ -e "$_sf.bad" ]; then
+		rm -f "$_sf.bad" "$_sf.out"
+		return 1
+	fi
+	cat "$_sf.out"
+	rm -f "$_sf.out"
+}
+
+# fx_same A B: both files could be read and have the same content.
+fx_same() {
+	_sa=$(fx_sum sha256 "$1") || return 1
+	_sb=$(fx_sum sha256 "$2") || return 1
+	[ -n "$_sa" ] && [ "$_sa" = "$_sb" ]
+}
+
+# fx_reg PATH: prints PATH when it is a regular file that is safe to read, else
+# /dev/null. For the system files that awk reads by name (/etc/passwd, /etc/group, the
+# package database): a FIFO planted in their place must not stall a tool.
+fx_reg() {
+	if [ -f "$1" ] && ! fx_refuse "$1" >/dev/null; then printf '%s\n' "$1"; else echo /dev/null; fi
+}
+
+# Sets FX_PW and FX_GR, the files the awk libraries read owner names from.
+fx_names_env() {
+	FX_PW=$(fx_reg /etc/passwd)
+	FX_GR=$(fx_reg /etc/group)
+	export FX_PW FX_GR
+}
 
 # fx_cmp ROOT COMPARE
 # stdin: ls lines (from fx_ls) of paths below ROOT ("" for the live system, or the
@@ -204,14 +250,14 @@ fx_pkgdb() {
 	# /opt/lib/opkg is Entware's database: its packages live below /opt
 	for _pd in "$_pr/usr/lib/opkg" "$_pr/opt/lib/opkg"; do
 		[ -d "$_pd/info" ] || continue
-		find "$_pd/info" -maxdepth 1 -name '*.list' -print0 2>/dev/null |
+		find "$_pd/info" -maxdepth 1 -type f -name '*.list' -print0 2>/dev/null |
 			xargs -0 -r awk 'FNR == 1 { p = FILENAME; sub(/.*\//, "", p); sub(/\.list$/, "", p) }
 				{ print "F\t" $0 "\t" p }' 2>/dev/null
-		[ -f "$_pd/status" ] && awk '
+		[ "$(fx_reg "$_pd/status")" != /dev/null ] && awk '
 			/^Package: / { p = $2 }
 			/^Version: / { if (p != "") print "V\t" p "\t" $2; p = "" }' "$_pd/status" 2>/dev/null
 	done
-	[ -f "$_pr/lib/apk/db/installed" ] && awk '
+	[ "$(fx_reg "$_pr/lib/apk/db/installed")" != /dev/null ] && awk '
 		/^P:/ { p = substr($0, 3); d = "" }
 		/^V:/ { print "V\t" p "\t" substr($0, 3) }
 		/^F:/ { d = substr($0, 3) }
@@ -363,7 +409,8 @@ fx_refuse() {
 fx_secret_name() {
 	case $1 in
 	*/dropbear_*_host_key | */ssh_host_*_key | *.key | *.pem | *.der | *.p12 | *.pfx | */id_rsa | */id_dsa | \
-		*/id_ecdsa | */id_ed25519 | */shadow | */shadow- | */shadow.* | *-secrets | *.kdbx | *.jks)
+		*/id_ecdsa | */id_ed25519 | */id_dropbear | */shadow | */shadow- | */shadow.* | *-secrets | *.kdbx | *.jks | \
+		*.psk | */privatekey | */presharedkey | */wireguard/*)
 		return 0
 		;;
 	esac
@@ -443,6 +490,7 @@ mcp_register read_file <<'EOF'
 {"name":"read_file","title":"Read a file","description":"Reads one file on the router with paging: text with line numbers, a binary file as hex dump (view=hex) or as its printable strings (view=strings). The header gives type, mode, owner, size, mtime and whether the file equals the same path in the firmware image. While redaction is on, text passes through the secret filter (Wi-Fi keys, password hashes and private keys are masked) and the raw views of key files are refused. FIFOs, sockets, device nodes and links into /proc, /sys or /dev are never opened.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the file."},"view":{"type":"string","enum":["auto","text","hex","strings"],"description":"auto (default): text for text files; for binary files the first 256 bytes as hex. text: lines. hex: hexdump -C. strings: printable strings of at least min_length characters.","default":"auto"},"offset":{"type":"integer","description":"Where to start: lines to skip for text and strings, bytes to skip for hex. Default 0.","default":0,"minimum":0},"limit":{"type":"integer","description":"How much to return: lines for text and strings (default 200, at most 2000), bytes for hex (default 512, at most 8192).","minimum":1},"min_length":{"type":"integer","description":"Shortest string for view=strings. Default 6.","default":6,"minimum":2,"maximum":64},"line_numbers":{"type":"boolean","description":"Prefix text lines with their line number. Default true.","default":true}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_read_file() {
+	fx_names_env
 	fx_path p path || return 1
 	arg view view auto
 	case $view in auto | text | hex | strings) ;; *) tool_error "view must be auto, text, hex or strings, got '$view'"; return 1 ;; esac
@@ -473,7 +521,15 @@ tool_read_file() {
 	binary=0
 	[ "$n1" = "$n2" ] || binary=1
 	[ "$view" = auto ] && { if [ "$binary" = 1 ]; then view=hexhead; else view=text; fi; }
+	case $view in hex | hexhead)
+		if ! have hexdump; then
+			[ "$view" = hex ] && { tool_error "hexdump: not available on this router; view=strings shows the readable parts"; return 1; }
+			view=nohex
+		fi
+		;;
+	esac
 	case $view in
+	nohex) arg_int lim limit 200 1 2000 || return 1 ;;
 	hex) arg_int lim limit 512 1 8192 || return 1 ;;
 	hexhead)
 		lim=256
@@ -546,6 +602,10 @@ tool_read_file() {
 		fi
 		[ "$binary" = 0 ] && [ "$MCP_REDACT" = 1 ] && echo "[text file: offsets count the redacted text]"
 		;;
+	nohex)
+		echo
+		echo "[binary file; hexdump: not available on this router. view=strings shows the readable parts, file_hash the hash]"
+		;;
 	strings)
 		if [ "$raw_ok" = 0 ]; then
 			tool_error "key material; raw views are refused while redaction is on (view=text masks it, file_hash still works)"
@@ -573,6 +633,7 @@ mcp_register list_dir <<'EOF'
 {"name":"list_dir","title":"List a directory","description":"Lists a directory: type, mode, owner, size, mtime, link target and, per entry, whether it equals the same path in the firmware image (same, CHANGED, meta, new). Use it to look around a suspicious location; depth lists subdirectories too. Entries are sorted by path; mount points are listed but not entered, and /proc, /sys and /dev are only listed one level deep.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the directory. Default /.","default":"/"},"depth":{"type":"integer","description":"Levels to descend. Default 1 (the directory's own entries).","default":1,"minimum":1,"maximum":6},"max_entries":{"type":"integer","description":"Stop after this many entries. Default 300.","default":300,"minimum":1,"maximum":2000},"compare_image":{"type":"boolean","description":"Compare each entry with the firmware image (hashes files of equal size). Default true.","default":true}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_list_dir() {
+	fx_names_env
 	fx_path p path / || return 1
 	arg_int depth depth 1 1 6 || return 1
 	arg_int max max_entries 300 1 2000 || return 1
@@ -595,7 +656,7 @@ tool_list_dir() {
 	[ "$p" = / ] && start=/
 	lst=$MCP_TMP/list.ls
 	# 5001 lines at most are ever kept; the listing says when that cut it short
-	find "$start" -xdev -mindepth 1 -maxdepth "$depth" ! -path '/tmp/openwrt-mcp.*' -print0 2>/dev/null |
+	find "$start" -xdev -mindepth 1 -maxdepth "$depth" ! -path "$MCP_TMP" ! -path "$MCP_TMP/*" -print0 2>/dev/null |
 		fx_ls | head -n 5001 >"$lst"
 	total=$(wc -l <"$lst")
 	printf 'directory %s' "$p"
@@ -633,6 +694,7 @@ mcp_register find_files <<'EOF'
 {"name":"find_files","title":"Find files","description":"Searches the filesystem by name, type, modification time, permission bits (setuid, setgid, world-writable, executable) and size, and lists the matches like list_dir, newest first, with the firmware-image comparison per match. Use it for questions like 'what changed in the last hour', 'which setuid files exist' or 'where is a file called X'. It stays on the filesystem of each root (never /proc, /sys, /dev); without a path it searches / and /tmp.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute directory to search. Default: / and /tmp (the RAM disk)."},"name":{"type":"string","description":"Shell pattern for the file name, e.g. '*.sh' or 'gl_*'. A pattern with a slash matches the whole path, e.g. '*/init.d/*'."},"type":{"type":"string","enum":["file","dir","symlink","char","block","fifo","socket"],"description":"Only entries of this type. Default: any."},"perm":{"type":"string","enum":["suid","sgid","world_writable","executable"],"description":"Only entries with this permission: setuid bit, setgid bit, writable by everyone (symlinks excluded), or any execute bit. Default: any."},"modified_within_minutes":{"type":"integer","description":"Only entries modified less than this many minutes ago.","minimum":1},"modified_before_minutes":{"type":"integer","description":"Only entries modified more than this many minutes ago.","minimum":1},"newer_than":{"type":"string","description":"Absolute path of a reference file: only entries modified after it."},"min_size":{"type":"integer","description":"Only files of at least this many bytes.","minimum":0},"max_size":{"type":"integer","description":"Only files of at most this many bytes.","minimum":0},"max_depth":{"type":"integer","description":"Levels to descend below the root. Default: unlimited.","minimum":1,"maximum":64},"order":{"type":"string","enum":["mtime","path"],"description":"mtime (default): newest first. path: sorted by path.","default":"mtime"},"max_results":{"type":"integer","description":"Stop after this many matches. Default 200.","default":200,"minimum":1,"maximum":2000},"compare_image":{"type":"boolean","description":"Compare each match with the firmware image. Default true.","default":true}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_find_files() {
+	fx_names_env
 	arg_int max max_results 200 1 2000 || return 1
 	arg order order mtime
 	case $order in mtime | path) ;; *) tool_error "order must be mtime or path, got '$order'"; return 1 ;; esac
@@ -664,7 +726,7 @@ tool_find_files() {
 		set -- "$@" -maxdepth "$n"
 		desc="$desc depth<=$n"
 	fi
-	set -- "$@" ! -path '/tmp/openwrt-mcp.*'
+	set -- "$@" ! -path "$MCP_TMP" ! -path "$MCP_TMP/*"
 	if arg_has name; then
 		arg name name
 		case $name in */*) set -- "$@" -path "$name" ;; *) set -- "$@" -name "$name" ;; esac
@@ -780,7 +842,10 @@ tool_file_hash() {
 		fi
 		run_timeout 60 fx_sum "$alg" "$p" >"$MCP_TMP/hash.one"
 		h=$(cat "$MCP_TMP/hash.one")
-		[ -n "$h" ] || h="(not hashed within 60 s)"
+		if [ -z "$h" ]; then
+			echo "  error    could not read the file (or not within 60 s); no hash"
+			continue
+		fi
 		FX_P="$p" awk -F'\t' -v alg="$alg" -v h="$h" '$9 == ENVIRON["FX_P"] {
 			printf "  %-8s %s\n  file     %s bytes, mode %s, owner %s:%s, mtime %s\n", alg, h, $7, $4, $5, $6, $8
 			if ($11 != "-") printf "  package  %s (%s)\n", $11, $12; else print "  package  none owns this path"
@@ -792,7 +857,9 @@ tool_file_hash() {
 			echo "  image    DIFFERENT TYPE: the image has a symlink -> $(readlink "$r" 2>/dev/null)"
 		elif [ -f "$r" ]; then
 			rh=$(fx_sum "$alg" "$r")
-			if [ "$rh" = "$h" ]; then
+			if [ -z "$rh" ]; then
+				echo "  image    could not read $r, not compared"
+			elif [ "$rh" = "$h" ]; then
 				echo "  image    same content ($r)"
 			else
 				echo "  image    DIFFERENT: $rh ($r)"
