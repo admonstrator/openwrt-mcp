@@ -270,7 +270,7 @@ _inv_proc_detail() { # PID
 		case $_t in /tmp/* | /var/* | /dev/shm/*) _n="$_n under /tmp,/var or /dev/shm (RAM);" ;; esac
 		if [ "$_l" = exe ] && lib_rom_ok; then
 			_p=${_t% (deleted)}
-			case $_p in /*) if in_rom "$_p"; then _n="$_n in firmware image;"; else _n="$_n NOT in firmware image;"; fi
+			case $_p in /*) if in_rom "$_p"; then _n="$_n in firmware image;"; else _n="$_n not in firmware image;"; fi
 				[ -n "$_up" ] && [ -e "$_up$_p" ] && _n="$_n present in overlay $_up;" ;; esac
 		fi
 		printf '%-9s %s%s\n' "$_l:" "$_t" "${_n:+   !!${_n%;}}"
