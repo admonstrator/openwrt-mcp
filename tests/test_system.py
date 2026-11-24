@@ -227,6 +227,14 @@ class TestPackages(OpenWrtTestCase):
         self.assertIn("compared with the firmware image", text)
         self.assertRegex(text, r"\nuhttpd\s+\S+\s+user")
         self.assertRegex(text, r"\nbusybox\s+\S+\s+image")
+        # what did not come with the image comes first, and the short config section
+        # comes before the long list, so neither is lost when the list is cut
+        self.assertLess(text.index("== Config files changed"), text.index("== Packages ("))
+        listing = text[text.index("== Packages ("):]
+        self.assertLess(listing.index("\nuhttpd "), listing.index("\nbusybox "))
+        text = self.tool_ok("packages", env=env, max_results=1)
+        self.assertRegex(text, r"\nuhttpd\s+\S+\s+user")
+        self.assertNotRegex(text, r"\nbusybox\s")
         text = self.tool_ok("packages", env=env, user_installed_only=True)
         self.assertRegex(text, r"\nuhttpd\s+\S+\s+user")
         self.assertNotRegex(text, r"\nbusybox\s")

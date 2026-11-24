@@ -493,7 +493,8 @@ tool_packages() {
 	fi
 	if [ -n "$_rom" ]; then rd "$_rom" >rom.txt; else : >rom.txt; fi
 	rd /etc/apk/world >world.txt
-	section "Packages ($_pm)"
+	# The list is built first and printed last: it can be long, and the changed config
+	# files below must not be lost to the output cap.
 	PM=$_pm FILTER=$_filter UO=$_uo MAXR=$_max ROM=$_rom awk '
 	function rec_end() {
 		if (name == "") return
@@ -529,7 +530,16 @@ tool_packages() {
 		if (ENVIRON["FILTER"] != "") printf "filter: \"%s\"\n", ENVIRON["FILTER"]
 		printf "%-36s %-32s %-10s %s\n", "NAME", "VERSION", "ORIGIN", "NOTE"
 		f = ENVIRON["FILTER"]; shown = 0; more = 0; nu = 0; byworld = 0
+		# packages that did not come with the image first: on a router with 800 packages
+		# the list may hit max_results or the output cap, and these are the ones that matter
 		for (i = 1; i <= n; i++) {
+			if (haverom && (N[i] in rv) && rv[N[i]] == V[i]) continue
+			if (!haverom && ENVIRON["PM"] == "opkg" && T[i] != "" && T[i] <= img + 600) continue
+			order[++no] = i; first[i] = 1
+		}
+		for (i = 1; i <= n; i++) if (!(i in first)) order[++no] = i
+		for (k = 1; k <= no; k++) {
+			i = order[k]
 			o = "-"; note = ""
 			if (haverom) {
 				if (!(N[i] in rv)) o = "user"
@@ -553,7 +563,7 @@ tool_packages() {
 		if (more) printf "... %d more not shown (max_results)\n", more
 		printf "user-installed or upgraded: %d\n", nu
 		if (byworld) print "note: without the firmware image user_installed_only shows the packages named in /etc/apk/world"
-	}' world.txt rom.txt db.txt
+	}' world.txt rom.txt db.txt >pk.txt
 
 	section "Config files changed against their package"
 	if [ "$_pm" = opkg ]; then
@@ -592,6 +602,9 @@ tool_packages() {
 			echo "apk: not available"
 		fi
 	fi
+
+	section "Packages ($_pm), not from the image first"
+	cat pk.txt
 
 	if [ "$_audit" = 1 ]; then
 		section "Package files changed against the package database"
