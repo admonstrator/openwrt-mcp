@@ -334,12 +334,12 @@ Searches by `name` (shell pattern; with a slash it matches the whole path), `typ
 `newer_than` (a reference file), `min_size`, `max_size` (bytes), `max_depth`. `path`
 defaults to `/` plus `/tmp` when that is its own filesystem. Output like `list_dir`,
 `order` `mtime` (newest first, default) or `path`, `max_results` default 200 (at most
-2000), `compare_image` default true. It stays on the filesystem of each root, never
+2000), `compare_image` default true. Only the server's own temp directory is left out. It stays on the filesystem of each root, never
 walks `/proc` or `/sys`, stops after 20000 matches or 40 s and says so.
 
 ### file_hash
 
-`paths` (1 to 50 absolute paths), `algorithm` (`sha256` default, `md5`; the images have no
+A file that cannot be read gets "could not read" and never a hash. `paths` (1 to 50 absolute paths), `algorithm` (`sha256` default, `md5`; the images have no
 `sha1sum`). Per file: hash, size, mode, mtime, owning package, and the comparison with
 the same path in the image (same, DIFFERENT with the image's hash, different type, not
 in the image). Refuses what `read_file` refuses; one refused path does not stop the rest.
@@ -438,6 +438,7 @@ lines (at most 25), why it matters and what to do.
 | `integrity.image_data_changed` | low | a data or configuration file of the image in a program directory differs, changed after first boot |
 | `integrity.first_boot_changes` | info | files in program directories that the firmware wrote at first boot |
 | `integrity.setuid_added` | high | setuid or setgid bit on an image program |
+| `integrity.process_memfd` | high | process whose program is a memfd (exists only in memory) |
 | `integrity.process_deleted_tmp_binary` | high | process whose program was deleted from `/tmp`, `/var`, `/dev/shm` |
 | `integrity.ld_preload` | high with `LD_PRELOAD` in a process or on glibc, else medium | `/etc/ld.so.preload` lines, process environments; a preloaded library that equals its image copy (procd's `/lib/libsetlbf.so`) is not reported |
 | `integrity.unowned_program` | medium | program in a system directory that neither the image nor a package provides |
@@ -446,11 +447,14 @@ lines (at most 25), why it matters and what to do.
 | `integrity.process_deleted_binary` | medium | process whose program file is gone (elsewhere) |
 | `integrity.process_not_from_image` | medium | process running a program that neither the image nor an added package provides |
 | `integrity.kernel_module_not_in_image` | medium | loaded module without a `.ko` in the image |
-| `integrity.mount_over_system_path` | medium | a mount on `/bin`, `/sbin`, `/lib`, `/usr`, `/www` or below |
+| `integrity.mount_over_system_path` | medium | a mount on `/bin`, `/sbin`, `/lib`, `/usr`, `/www` or below, other than a read-only squashfs or erofs |
+| `integrity.image_mount` | info | read-only squashfs or erofs mounted below those directories (firmware data partitions such as `/lib/firmware`) |
 | `integrity.image_file_deleted` | low | whiteouts for image programs (not when the package was removed, not `/etc/rc.d` links of disabled services) |
 | `integrity.package_upgrades` | info | image files replaced by a package upgrade, counted per package |
 | `persistence.image_script_changed` | high | image init, hotplug, inittab, rpcd or LuCI script that differs from the image, changed after first boot |
 | `persistence.autostart_added` | medium | autostart file that neither the image nor a package provides (not dnsmasq files, not `.nft` files, not first-boot files) |
+| `persistence.autostart_link` | medium | an autostart file (cron, `rc.local`, init, hooks, profile) that is a link resolving into `/tmp`, `/var`, `/run` or `/dev/shm` |
+| `persistence.module_autoload` | medium | new or changed files in `/etc/modules.d` and `/etc/modules-boot.d` that no package owns, with the modules they load |
 | `persistence.dnsmasq_hook` | medium | `dhcp-script`, `dhcp-luascript` or `conf-script` in a dnsmasq file that differs from the image, or uci `dhcpscript`, naming a program that is not an unchanged image file |
 | `persistence.firewall_rules_added` | low | `.nft` rule files that neither the image nor a package provides |
 | `persistence.first_boot_changes` | info | startup scripts that the firmware wrote at first boot |
@@ -475,6 +479,19 @@ when it is bound to all addresses or to an address on one of the zone's devices.
 loaded nft or iptables ruleset is not evaluated rule by rule, so custom includes can open
 or close more; the finding's confidence line says so. The stock rules for the DHCP
 clients (udp 68, 546) are not reported.
+
+The process checks leave out the server itself and everything its tool calls started
+(`MCP_CALL_TAG` of this server in the environment), and treat a program below `$MCP_ROM`
+as part of the image. Content checks read autostart files through links (never links
+into `/proc`, `/sys`, `/dev`).
+
+Limits that are said, not hidden: the overlay scan stops after 20000 entries and each
+persistence location after 500; when either happens, `audit` lists it under "Could not
+check", and `overlay_diff` and `persistence` print a note. When no zone can be identified
+as the WAN side, the exposure checks are listed as not checked; when the default route
+leaves through the zone of the network `lan` (access point or client mode), that zone is
+not treated as WAN and the audit says that exposure to the upstream network was not
+assessed.
 
 Each thing is reported by one check: autostart locations belong to the persistence
 checks, so the integrity checks skip them, and a socket the zone policy already opens is

