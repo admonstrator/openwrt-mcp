@@ -112,7 +112,7 @@ au_exposure_data() {
 		# shellcheck disable=SC2013  # network names are words
 		for _n in $(awk -F'\t' '$1 == "Z" && $4 != "-" { print $4 }' "$AU/fw"); do
 			_d=
-			if have ubus; then _d=$(ubus call "network.interface.$_n" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); fi
+			if have ubus; then _d=$(ubus -t 2 call "network.interface.$_n" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); fi
 			[ -n "$_d" ] || _d=$(uci -q get "network.$_n.device" 2>/dev/null) || _d=$(uci -q get "network.$_n.ifname" 2>/dev/null)
 			[ -n "$_d" ] || continue
 			[ "$AU_WANDEV" = unknown ] && AU_WANDEV=no

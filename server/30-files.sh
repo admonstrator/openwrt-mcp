@@ -694,7 +694,8 @@ tool_file_hash() {
 	[ "$n" -le 50 ] || { tool_error "at most 50 paths per call, got $n"; return 1; }
 	fx_rom_ok || echo "note: no usable firmware image at $MCP_ROM, hashes are not compared"
 	meta=$MCP_TMP/hash.meta
-	tr '\n' '\0' <"$lst" | fx_ls | fx_cmp "" 0 | fx_pkg >"$meta"
+	# only absolute paths reach ls: anything else could be read as an option
+	grep '^/' "$lst" | tr '\n' '\0' | fx_ls | fx_cmp "" 0 | fx_pkg >"$meta"
 	while IFS= read -r p; do
 		echo
 		echo "$p"
