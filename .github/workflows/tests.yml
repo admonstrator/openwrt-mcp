@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (server modules as POSIX sh, launcher as bash)
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable -s sh server/*.sh
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable bin/openwrt-mcp
+      - name: sh -n on the joined server (dash and the oldest busybox ash)
+        run: |
+          bin/openwrt-mcp --build "$RUNNER_TEMP/openwrt-mcp.sh"
+          sh -n "$RUNNER_TEMP/openwrt-mcp.sh"
+          docker run --rm -v "$RUNNER_TEMP/openwrt-mcp.sh:/s.sh:ro" openwrt/rootfs:x86-64-21.02.7 sh -n /s.sh
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        openwrt: ["21.02.7", "23.05.5", "24.10.4", "25.12.0"]
+    env:
+      OPENWRT_IMAGE: openwrt/rootfs:x86-64-${{ matrix.openwrt }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: pull the OpenWrt rootfs image
+        run: docker pull "$OPENWRT_IMAGE"
+      - name: unittest
+        run: python3 -W ignore -m unittest discover -s tests -v
