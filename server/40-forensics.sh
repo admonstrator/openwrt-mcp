@@ -320,7 +320,7 @@ tool_persistence() {
 			continue
 		fi
 		if [ "$only" = 1 ] && ! grep -qv "^$loc$FX_TAB""same$FX_TAB" "$rec.l"; then
-			echo "  (all $(wc -l <"$rec.l") entries are identical to the image)"
+			echo "  ($(wc -l <"$rec.l") entries, none differs from the image)"
 			continue
 		fi
 		case $loc in

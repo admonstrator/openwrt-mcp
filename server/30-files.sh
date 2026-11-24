@@ -108,7 +108,7 @@ fx_sortk() {
 
 # Helpers that run under run_timeout. They write to a file, never into a pipe: the
 # watchdog of run_timeout keeps the pipe open and the reader would wait for it.
-fx_snap() { rd "$1" 2>/dev/null | head -c 1048576; }
+fx_snap() { cat "$1" 2>/dev/null | head -c 1048576; }
 fx_find_ls() { find "$@" -print0 2>/dev/null | fx_ls | head -n 20001; }
 fx_sum() { rd "$2" | "${1}sum" | cut -d' ' -f1; }
 
@@ -188,14 +188,16 @@ fx_cmp() {
 # opkg (info/*.list, status) on 21.02-24.10, apk (db/installed) on 25.12.
 fx_pkgdb() {
 	_pr=${1%/}
-	if [ -d "$_pr/usr/lib/opkg/info" ]; then
-		find "$_pr/usr/lib/opkg/info" -maxdepth 1 -name '*.list' -print0 2>/dev/null |
+	# /opt/lib/opkg is Entware's database: its packages live below /opt
+	for _pd in "$_pr/usr/lib/opkg" "$_pr/opt/lib/opkg"; do
+		[ -d "$_pd/info" ] || continue
+		find "$_pd/info" -maxdepth 1 -name '*.list' -print0 2>/dev/null |
 			xargs -0 -r awk 'FNR == 1 { p = FILENAME; sub(/.*\//, "", p); sub(/\.list$/, "", p) }
 				{ print "F\t" $0 "\t" p }' 2>/dev/null
-		[ -f "$_pr/usr/lib/opkg/status" ] && awk '
+		[ -f "$_pd/status" ] && awk '
 			/^Package: / { p = $2 }
-			/^Version: / { if (p != "") print "V\t" p "\t" $2; p = "" }' "$_pr/usr/lib/opkg/status" 2>/dev/null
-	fi
+			/^Version: / { if (p != "") print "V\t" p "\t" $2; p = "" }' "$_pd/status" 2>/dev/null
+	done
 	[ -f "$_pr/lib/apk/db/installed" ] && awk '
 		/^P:/ { p = substr($0, 3); d = "" }
 		/^V:/ { print "V\t" p "\t" substr($0, 3) }
@@ -261,14 +263,16 @@ fx_refuse() {
 		/proc/* | /sys/*) ;; # the kernel's own links (/proc/mounts, /proc/PID/exe): judged by what they resolve to
 		*)
 			case $_ft in
-			'') echo "dangling symlink -> $(readlink "$1" 2>/dev/null)"; return 0 ;;
 			/proc/* | /sys/* | /dev/*) echo "symlink into $_ft (links into /proc, /sys and /dev are not followed)"; return 0 ;;
 			esac
 			;;
 		esac
 	fi
 	if [ -d "$1" ]; then echo "is a directory (use list_dir)"; return 0; fi
-	if [ ! -e "$1" ]; then echo "no such file"; return 0; fi
+	if [ ! -e "$1" ]; then
+		if [ -L "$1" ]; then echo "dangling symlink -> $(readlink "$1" 2>/dev/null)"; else echo "no such file"; fi
+		return 0
+	fi
 	if [ ! -f "$1" ]; then
 		echo "not a regular file (FIFOs, sockets and device nodes are never opened; list_dir shows its type)"
 		return 0
@@ -312,6 +316,10 @@ fx_redact_kv() {
 	{
 		line = $0
 		if (ppp && line !~ /^[ \t]*#/ && NF >= 3) { print $1, $2, "<redacted>"; next }
+		# WEP key slots of /etc/config/wireless (key1..key4), which redact does not know
+		if (match(line, /^[ \t]*(option|list)[ \t]+["\047]?key[1-4]["\047]?[ \t]+/) || match(line, /^[^=. ]+\.[^=. ]+\.key[1-4]=/)) {
+			print substr(line, 1, RLENGTH) "\047<redacted>\047"; next
+		}
 		if (match(line, /^[ \t]*(export[ \t]+)?[A-Za-z0-9_.-]+[ \t]*[=:][ \t]*/)) {
 			head = substr(line, 1, RLENGTH); val = substr(line, RLENGTH + 1)
 			name = head; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/[ \t]*[=:][ \t]*$/, "", name)
@@ -323,7 +331,19 @@ fx_redact_kv() {
 			if (tolower(name) ~ re) { sub(/:[ \t]*"[^"]*"$/, ": \"<redacted>\"", pair) }
 			out = out substr(line, 1, RSTART - 1) pair; line = substr(line, RSTART + RLENGTH)
 		}
-		print out line
+		line = out line; out = ""
+		# password=... inside a command line or a URL (cron jobs for DDNS, rc.local)
+		while (match(line, /([Pp]ass(word|wd)?|PASS(WORD|WD)?|[Ss]ecret|SECRET|[Tt]oken|TOKEN)=[^ \t&;"\047<]+/)) {
+			pair = substr(line, RSTART, RLENGTH); sub(/=.*/, "=<redacted>", pair)
+			out = out substr(line, 1, RSTART - 1) pair; line = substr(line, RSTART + RLENGTH)
+		}
+		line = out line
+		# scheme://user:password@host
+		if (match(line, /:\/\/[^\/ \t:@]+:[^\/ \t@]+@/)) {
+			cred = substr(line, RSTART, RLENGTH); sub(/:[^:@]+@$/, ":<redacted>@", cred)
+			line = substr(line, 1, RSTART - 1) cred substr(line, RSTART + RLENGTH)
+		}
+		print line
 	}'
 }
 
@@ -349,7 +369,7 @@ fx_show() {
 
 # ---------------------------------------------------------------- read_file
 mcp_register read_file <<'EOF'
-{"name":"read_file","title":"Read a file","description":"Reads one file on the router with paging. Text is shown with line numbers; a binary file gets a hex dump (view=hex) or its printable strings (view=strings). The header gives type, mode, owner, size, mtime and whether the file equals the same path in the firmware image. While redaction is on, text passes through the secret filter (Wi-Fi keys, password hashes, private keys are masked) and raw views of key files are refused. FIFOs, sockets, device nodes and links into /proc, /sys or /dev are never opened.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the file."},"view":{"type":"string","enum":["auto","text","hex","strings"],"description":"auto (default): text for text files; for binary files the first 256 bytes as hex. text: lines. hex: hexdump -C. strings: printable strings of at least min_length characters.","default":"auto"},"offset":{"type":"integer","description":"Where to start: lines to skip for text and strings, bytes to skip for hex. Default 0.","default":0,"minimum":0},"limit":{"type":"integer","description":"How much to return: lines for text and strings (default 200, at most 2000), bytes for hex (default 512, at most 8192).","minimum":1},"min_length":{"type":"integer","description":"Shortest string for view=strings. Default 6.","default":6,"minimum":2,"maximum":64},"line_numbers":{"type":"boolean","description":"Prefix text lines with their line number. Default true.","default":true}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"read_file","title":"Read a file","description":"Reads one file on the router with paging: text with line numbers, a binary file as hex dump (view=hex) or as its printable strings (view=strings). The header gives type, mode, owner, size, mtime and whether the file equals the same path in the firmware image. While redaction is on, text passes through the secret filter (Wi-Fi keys, password hashes and private keys are masked) and the raw views of key files are refused. FIFOs, sockets, device nodes and links into /proc, /sys or /dev are never opened.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the file."},"view":{"type":"string","enum":["auto","text","hex","strings"],"description":"auto (default): text for text files; for binary files the first 256 bytes as hex. text: lines. hex: hexdump -C. strings: printable strings of at least min_length characters.","default":"auto"},"offset":{"type":"integer","description":"Where to start: lines to skip for text and strings, bytes to skip for hex. Default 0.","default":0,"minimum":0},"limit":{"type":"integer","description":"How much to return: lines for text and strings (default 200, at most 2000), bytes for hex (default 512, at most 8192).","minimum":1},"min_length":{"type":"integer","description":"Shortest string for view=strings. Default 6.","default":6,"minimum":2,"maximum":64},"line_numbers":{"type":"boolean","description":"Prefix text lines with their line number. Default true.","default":true}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_read_file() {
 	fx_path p path || return 1
@@ -363,15 +383,16 @@ tool_read_file() {
 	fi
 	src=$p
 	note=
+	kernel=0
 	case $p in
 	/proc/* | /sys/*)
-		# kernel files have no size and may stall: copy at most 1 MB with a time limit.
-		# rd refuses links into /proc, so a kernel link (/proc/mounts) is resolved first;
-		# /proc/PID/exe is read as it is, which also works for a deleted binary.
-		real=$(readlink -f "$p" 2>/dev/null)
-		case $real in /proc/* | /sys/*) ;; *) real=$p ;; esac
+		# Kernel files have no size and may stall: copy at most 1 MB with a time limit.
+		# This is the one read that does not go through rd: rd refuses links into /proc,
+		# and /proc/mounts or /proc/PID/exe (which still reads a deleted binary) are such
+		# links. fx_refuse has already ruled out the files that block.
+		kernel=1
 		src=$MCP_TMP/read.snap
-		run_timeout 5 fx_snap "$real" >"$src"
+		run_timeout 5 fx_snap "$p" >"$src"
 		note="kernel file: read once with a 5 s limit, at most 1048576 bytes"
 		;;
 	esac
@@ -381,8 +402,16 @@ tool_read_file() {
 	binary=0
 	[ "$n1" = "$n2" ] || binary=1
 	[ "$view" = auto ] && { if [ "$binary" = 1 ]; then view=hexhead; else view=text; fi; }
+	case $view in
+	hex) arg_int lim limit 512 1 8192 || return 1 ;;
+	hexhead)
+		lim=256
+		off=0
+		;;
+	*) arg_int lim limit 200 1 2000 || return 1 ;;
+	esac
 
-	printf '%s\0' "$p" | fx_ls | fx_cmp "" 1 | FX_SRC="$src" FX_P="$p" FX_BIN="$binary" awk -F'\t' "$FX_AWK_FMT"'
+	printf '%s\0' "$p" | fx_ls | fx_cmp "" "$((1 - kernel))" | FX_P="$p" FX_BIN="$binary" FX_K="$kernel" awk -F'\t' "$FX_AWK_FMT"'
 		BEGIN { fx_names() }
 		{
 			fx_rec()
@@ -392,6 +421,7 @@ tool_read_file() {
 			if (R_state == "noimage") w = "not compared (no usable firmware image)"
 			if (R_state == "new") w = "not in the firmware image"
 			if (R_state == "same") w = "same as the firmware image"
+			if (ENVIRON["FX_K"] == 1) w = "not applicable (kernel file)"
 			printf "image  %s%s\n", w, (R_detail != "-") ? " (" R_detail ")" : ""
 		}'
 	size=$(rd "$src" | wc -c)
@@ -402,7 +432,6 @@ tool_read_file() {
 	if [ "$MCP_REDACT" = 1 ] && fx_secret_name "$p"; then raw_ok=0; fi
 	case $view in
 	text)
-		arg_int lim limit 200 1 2000 || return 1
 		total=$(rd "$src" | wc -l)
 		if [ "$binary" = 1 ] && [ "$raw_ok" = 0 ]; then
 			tool_error "binary key material; not shown while redaction is on (file_hash still works)"
@@ -426,12 +455,6 @@ tool_read_file() {
 			}'
 		;;
 	hex | hexhead)
-		if [ "$view" = hexhead ]; then
-			lim=256
-			off=0
-		else
-			arg_int lim limit 512 1 8192 || return 1
-		fi
 		if [ "$raw_ok" = 0 ]; then
 			tool_error "key material; raw views are refused while redaction is on (view=text masks it, file_hash still works)"
 			return 1
@@ -453,7 +476,6 @@ tool_read_file() {
 		[ "$binary" = 0 ] && [ "$MCP_REDACT" = 1 ] && echo "[text file: offsets count the redacted text]"
 		;;
 	strings)
-		arg_int lim limit 200 1 2000 || return 1
 		if [ "$raw_ok" = 0 ]; then
 			tool_error "key material; raw views are refused while redaction is on (view=text masks it, file_hash still works)"
 			return 1

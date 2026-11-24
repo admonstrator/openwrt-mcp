@@ -542,17 +542,15 @@ au_updates() {
 	_now=$(date +%s)
 	if [ -z "$_b" ] || [ "$_now" -lt 1700000000 ] || [ "$_now" -lt "$_b" ]; then
 		au_skip updates.firmware_age "the clock is not set or the build date is unreadable (now: $(date '+%Y-%m-%d'))"
-	else
-		_days=$(((_now - _b) / 86400))
-		[ "$_days" -gt 365 ] && echo "$_f is dated $(date -r "$_f" '+%Y-%m-%d'), $_days days ago; release $_rel${_gl:+, GL.iNet firmware $_gl}"
-	fi | {
-		if [ -z "$_b" ] || [ "$_now" -lt 1700000000 ] || [ "$_now" -lt "$_b" ]; then cat >/dev/null; else
-			au_add low updates.firmware_age "medium: the date of the firmware's release file stands in for the build date; whether a newer firmware exists was not checked (no network access)" \
-				"The firmware build is more than a year old" \
-				"A year without a firmware update usually means published security fixes are missing." \
-				"Check for a newer firmware for this model and install it."
-		fi
-	}
+		return 0
+	fi
+	_days=$(((_now - _b) / 86400))
+	if [ "$_days" -gt 365 ]; then
+		echo "$_f is dated $(date -r "$_f" '+%Y-%m-%d'), $_days days ago; release $_rel${_gl:+, GL.iNet firmware $_gl}"
+	fi | au_add low updates.firmware_age "medium: the date of the firmware's release file stands in for the build date; whether a newer firmware exists was not checked (no network access)" \
+		"The firmware build is more than a year old" \
+		"A year without a firmware update usually means published security fixes are missing." \
+		"Check for a newer firmware for this model and install it."
 }
 
 # ---------------------------------------------------------------- Wi-Fi
@@ -577,7 +575,8 @@ au_wifi() {
 			if (e == "none") print (m == "ap") ? "open_ap" : "open_sta", d
 			else if (e ~ /^wep/) print "wep", d
 			else if (e ~ /^(psk|wpa)($|\+)/) print "wpa1", d " (WPA1 only)"
-			else if (e ~ /mixed/) print "mixed", d " (WPA1 still accepted)"
+			# psk-mixed and wpa-mixed are WPA1+WPA2; sae-mixed and wpa3-mixed are WPA2+WPA3
+			else if (e ~ /^(psk|wpa)-mixed/) print "mixed", d " (WPA1 still accepted)"
 			else if (e ~ /tkip/ && e !~ /ccmp|aes/) print "mixed", d " (TKIP only)"
 			if (v[s, "wps_label"] == "1" || v[s, "wps_pin"] != "") print "wps_pin", d ", WPS PIN enabled"
 			else if (v[s, "wps_pushbutton"] == "1") print "wps_pbc", d ", WPS push button enabled"
@@ -616,7 +615,7 @@ au_wifi() {
 
 # ---------------------------------------------------------------- audit
 mcp_register audit <<'EOF'
-{"name":"audit","title":"Security audit","description":"Runs all security checks in one call and returns findings ordered by severity (high, medium, low, info), each with a stable check id, a confidence statement, the evidence it rests on (file, line, pid or socket), why it matters and what to do. Covers exposure (listeners the WAN side can reach, port forwards), authentication (root without password, extra uid 0 accounts, SSH keys, SSH password login from WAN), integrity against the firmware image (replaced programs, setuid bits, unowned programs, executables in /tmp, processes running deleted or foreign binaries, kernel modules, ld.so.preload), persistence (autostart entries the image does not have), update state and Wi-Fi encryption. It ends with the checks that found nothing and the checks that could not run on this device and why. Start here, then use the specific tools to follow up a finding.","inputSchema":{"type":"object","properties":{"categories":{"type":"array","items":{"type":"string","enum":["exposure","auth","integrity","persistence","updates","wifi"]},"description":"Only these categories. Default: all six."},"min_severity":{"type":"string","enum":["info","low","medium","high"],"description":"Leave out findings below this severity. Default info (everything).","default":"info"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
+{"name":"audit","title":"Security audit","description":"Runs all security checks in one call and returns findings ordered by severity (high, medium, low, info), each with a stable check id, a confidence statement, the evidence it rests on (file, line, pid or socket), why it matters and what to do. It covers exposure to the WAN side, authentication (root password, uid 0 accounts, SSH keys and password logins), integrity against the firmware image (replaced programs, executables in /tmp, processes running deleted or foreign binaries, kernel modules, ld.so.preload), autostart entries the image does not have, update state and Wi-Fi encryption. The output ends with the checks that found nothing and the checks that could not run on this device and why. Start here, then follow up a finding with the specific tools.","inputSchema":{"type":"object","properties":{"categories":{"type":"array","items":{"type":"string","enum":["exposure","auth","integrity","persistence","updates","wifi"]},"description":"Only these categories. Default: all six."},"min_severity":{"type":"string","enum":["info","low","medium","high"],"description":"Leave out findings below this severity. Default info (everything).","default":"info"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}
 EOF
 tool_audit() {
 	arg minsev min_severity info
