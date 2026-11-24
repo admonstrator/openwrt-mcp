@@ -1,6 +1,6 @@
 ---
 name: openwrt-router-audit
-description: Investigate an OpenWrt or GL.iNet router through the openwrt-mcp tools (audit, overlay_diff, persistence, processes, connections, firewall, users_auth, file tools) and report what to look at first. Use this whenever the user wants a router audited, checked for compromise, malware (gl-helper and the like), backdoors, open ports, unexpected changes since flashing, unknown processes or SSH keys, or asks "is my router clean / safe / hacked", "what is exposed to the WAN", "what changed on the router", even when they do not name the tools or the server. Also use it when following up on a single audit finding. German triggers too: Router prüfen, untersuchen, auditieren, kompromittiert, Schadsoftware, offene Ports.
+description: Investigate an OpenWrt or GL.iNet router through the openwrt-mcp tools (audit, overlay_diff, persistence, processes, connections, firewall, users_auth, file tools) and report what to look at first. Use this whenever the user wants a router audited, checked for compromise, malware (gl-helper and the like), backdoors, open ports, unexpected changes since flashing, unknown processes or SSH keys, or asks "is my router clean / safe / hacked", "what is exposed to the WAN", "what changed on the router", even when they do not name the tools or the server. Also use it when following up on a single audit finding. German triggers too, such as Router prüfen, untersuchen, auditieren, kompromittiert, Schadsoftware, offene Ports.
 ---
 
 # Investigating an OpenWrt router with openwrt-mcp
