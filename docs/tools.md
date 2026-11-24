@@ -485,8 +485,8 @@ lines (at most 25), why it matters and what to do.
 | `persistence.first_boot_changes` | info | startup scripts that the firmware wrote at first boot |
 | `persistence.user_autostart` | low; medium when a line downloads, pipes into a shell or uses the RAM disk | active lines of cron files (not crond's `cron.update`), `rc.local`, changed profile and firewall scripts |
 | `persistence.feeds_changed` | low | package feeds or keys that differ from the image |
-| `persistence.live_crontab` | medium when a line runs a program from the RAM disk, names one that does not exist, downloads or pipes into a shell; else low | active lines of the crontabs the running crond reads outside `/etc/crontabs` (GL.iNet: `/tmp/gl_crontabs`) whose programs are not unchanged image files (not in the image, changed, a shell expansion), each with the reason |
-| `persistence.live_crontab_firmware` | info | the other lines of those crontabs: every program they run is an unchanged image file or a shell builtin (GL.iNet's own jobs) |
+| `persistence.live_crontab` | medium when a line runs a program from the RAM disk, names one that does not exist, downloads, pipes into a shell or gives a network tool (`nc`, `ncat`, `socat`, `telnet`, also through busybox) a program to run; else low | active lines of the crontabs the running crond reads outside `/etc/crontabs` (GL.iNet: `/tmp/gl_crontabs`) that are not fully judged firmware jobs: a program that is not an unchanged image file (not in the image, changed, a shell expansion), or a command that runs another program through a shell, `eval`, `exec`, `nice`, `nohup`, `timeout`, `env`, `xargs`, `setsid`, `start-stop-daemon`, `flock`, `busybox APPLET`, `su`, `chroot`, `find -exec` and the like, or command substitution; each with the reason |
+| `persistence.live_crontab_firmware` | info | the other lines of those crontabs: every command is simple and runs an unchanged image file, a plain shell builtin or a function of an image file the line sources (GL.iNet's own jobs) |
 | `persistence.package_autostart` | info | autostart files of packages installed after flashing |
 | `updates.branch_eol` | medium (low on GL.iNet firmware) | `DISTRIB_RELEASE` on a branch in the built-in end-of-life list (17.01 to 23.05, as of 2026-11) |
 | `updates.firmware_age` | low | release file of the image older than 365 days |
@@ -527,7 +527,15 @@ not repeated for a rule. A line of a live crontab that also stands in a file of
 line by the programs it runs: the first word of every command (after `.` or `source`
 the file read, after `sh`, `lua` and other interpreters the script), bare names looked
 up in `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`; a name that a sourced file defines as a
-function counts as that file. Arguments are not judged.
+function counts as that file. Only a line whose every command is simple and judged that
+way is a firmware job (info). A command whose first word runs something else (a shell or
+interpreter, `eval`, `exec`, `command`, `trap`, `nice`, `nohup`, `timeout`, `env`,
+`xargs`, `setsid`, `start-stop-daemon`, `flock`, `busybox APPLET`, `su`, `sudo`,
+`chroot`, `time`, `ionice`, `taskset`, `watch`, `nsenter`, `unshare`, `ssh`, `find` with
+`-exec`), command substitution (`$(...)`, backticks), and a network tool with a program
+to run make it a `persistence.live_crontab` finding with the reason; the program run
+that way is not judged. Other arguments are not judged either (`awk` calling
+`system()`, for one, is not seen).
 
 The GL.iNet checks need `/etc/glversion`; on other firmware they are listed under "Could
 not check". They read uci, files and `/proc` (decision 2.5), compare `oui-httpd` with the

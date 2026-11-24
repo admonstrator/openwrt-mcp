@@ -831,8 +831,12 @@ au_cron_word() {
 # /tmp/gl_crontabs, rebuilt at boot). Each active line is judged by the programs it
 # runs: the first word of every command (after "." or "source" the file it reads, after
 # an interpreter the script it runs); a name the line's sourced file defines as a
-# function counts as that file. Lines that also stand in /etc/crontabs are left to
-# persistence.user_autostart, so that each line is reported once.
+# function counts as that file. A command that runs another program the check cannot
+# see (a shell, eval, nice, xargs, busybox APPLET, ...), command substitution and a
+# network tool with -e/-c make the line a finding: only lines whose every command is
+# simple and fully judged count as firmware jobs. Lines that also stand in
+# /etc/crontabs are left to persistence.user_autostart, so that each line is reported
+# once.
 au_cron_live() {
 	_cw=$AU/cl
 	mkdir -p "$_cw"
@@ -854,14 +858,19 @@ au_cron_live() {
 		printf '%s\t%s\n' "$_n" "$_p" >>"$_cw/idx"
 	done <"$_cw/files"
 	# L id text: one per active line (text redacted); W id kind word: P program, S
-	# sourced file, U not resolvable (a shell expansion)
+	# sourced file, U not resolvable (a shell expansion); R id level reason: the line
+	# runs something that was not judged (a wrapper, a shell, command substitution) or
+	# hands a shell to the network. A line is a firmware job only when every command in
+	# it is simple and fully judged.
 	FX_E="$_cw/etc" FX_I="$_cw/idx" FX_W="$_cw" awk '
 	function norm(s) { gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }
-	function words(cmd, id,   segs, ns, k, t, nt, i, w, first, src, interp, skip, b) {
+	function words(cmd, id,   segs, ns, k, t, nt, i, j, x, w, first, src, interp, skip, b, a, seg) {
+		if (cmd ~ /`|[$]\(/) print "R\t" id "\t1\tcommand substitution; what it runs was not judged"
 		gsub(/[0-9]*>&[0-9-]+/, " ", cmd); gsub(/&>/, ">", cmd)
 		gsub(/[|&;()`]/, ";", cmd)
 		ns = split(cmd, segs, ";")
 		for (k = 1; k <= ns; k++) {
+			seg = segs[k]; gsub("[\"\047]", "", seg)
 			nt = split(segs[k], t, /[ \t]+/)
 			first = ""; src = 0; interp = 0; skip = 0
 			for (i = 1; i <= nt; i++) {
@@ -870,13 +879,22 @@ au_cron_live() {
 				if (skip) { skip = 0; continue }
 				if (w ~ /^[0-9]*[<>]/) { if (w ~ /^[0-9]*[<>]+$/) skip = 1; continue }
 				if (first == "") {
-					if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w == "exec" || w == "nohup" || w == "env" || w == "command" || w == "!" || w == "if" || w == "then" || w == "else" || w == "while" || w == "do") continue
+					if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || w == "!" || w == "if" || w == "then" || w == "else" || w == "elif" || w == "while" || w == "until" || w == "do" || w == "{") continue
 					first = w
 					if (w == "." || w == "source") { src = 1; continue }
 					if (w ~ /[$`]/) { print "W\t" id "\tU\t" w; break }
 					print "W\t" id "\tP\t" w
 					b = w; sub(/.*\//, "", b)
-					if (b ~ /^(sh|ash|bash|dash|lua|ucode|perl|python[0-9.]*)$/) { interp = 1; continue }
+					# busybox APPLET: judge the applet name for the network test below
+					a = b
+					if (b == "busybox") for (j = i + 1; j <= nt; j++) { x = t[j]; gsub("[\"\047]", "", x); if (x != "" && x !~ /^-/) { a = x; sub(/.*\//, "", a); break } }
+					if (a ~ /^(nc|ncat|netcat|socat|telnet)$/ && (seg ~ /[ \t]-[A-Za-z]*[ec]([ \t]|$)/ || tolower(seg) ~ /(exec|system):/))
+						print "R\t" id "\t2\t" a " with a program to run (-e, -c, exec:): a network tool that hands a shell to the other side"
+					if (b ~ /^(sh|ash|bash|dash|zsh|ksh|lua|ucode|perl|python[0-9.]*|eval|exec|command|trap|nice|nohup|timeout|env|xargs|setsid|start-stop-daemon|flock|busybox|su|sudo|chroot|time|ionice|taskset|stdbuf|watch|nsenter|unshare|runuser|chpst|strace|ssh|find)$/) {
+						if (b != "find" || seg ~ /[ \t]-(exec|execdir|ok|okdir)([ \t]|$)/)
+							print "R\t" id "\t1\truns another program through " b "; the program it runs was not judged"
+					}
+					if (b ~ /^(sh|ash|bash|dash|zsh|ksh|lua|ucode|perl|python[0-9.]*)$/) { interp = 1; continue }
 					break
 				}
 				if (src) { print "W\t" id "\t" ((w ~ /[$`]/) ? "U" : "S") "\t" w; break }
@@ -950,29 +968,36 @@ au_cron_live() {
 			if (lvl(c) > best) best = lvl(c)
 			if (lvl(c) > 0) { if (note != "") note = note "; "; note = note w ": " d }
 		}
+		for (i = 1; i <= nr; i++) {
+			if (rl[i] > best) best = rl[i]
+			if (index(note, rr[i])) continue
+			if (note != "") note = note "; "
+			note = note rr[i]
+		}
 		if (line ~ /(wget|curl|uclient-fetch|tftp|base64)/ || line ~ /\|[ \t]*(sh|ash|bash)([ \t;&]|$)/) {
 			best = 2; if (note != "") note = note "; "; note = note "downloads or pipes into a shell"
 		}
 		if (note != "") note = "  <- " note
 		print best "\t" line note
-		cur = ""; nw = 0
+		cur = ""; nw = 0; nr = 0
 	}
 	FILENAME == ENVIRON["FX_C"] { cls[$2] = $3; det[$2] = $4; next }
 	FILENAME == ENVIRON["FX_F"] { fn[$2, $3] = 1; next }
 	$1 == "L" { flush(); cur = $2; line = substr($0, length($1 $2) + 3); next }
 	$1 == "W" { ww[++nw] = $4; kd[nw] = $3; next }
+	$1 == "R" { rl[++nr] = $3 + 0; rr[nr] = $4; next }
 	END { flush() }' "$_cw/cls" "$_cw/funcs" "$_cw/p1" >"$_cw/eval"
 	_sev=low
 	grep -q '^2' "$_cw/eval" && _sev=medium
 	awk -F'\t' '$1 > 0 { print $2 }' "$_cw/eval" |
 		au_add "$_sev" persistence.live_crontab "medium: the crontab is one the running crond reads (its -c directory); each program was compared with the firmware image, which says where it comes from, not what the line does" \
 			"Jobs in a crontab outside /etc/crontabs run programs the firmware does not ship" \
-			"crond runs these lines although they are not in /etc/crontabs: they come from the directory its -c option names. On GL.iNet that is /tmp/gl_crontabs, which the firmware rebuilds at every boot from its own jobs; a line whose program is not part of the image, lives on the RAM disk or does not exist was put there by something else. Lines marked medium run from the RAM disk, name a missing program, download or pipe into a shell." \
+			"crond runs these lines although they are not in /etc/crontabs: they come from the directory its -c option names. On GL.iNet that is /tmp/gl_crontabs, which the firmware rebuilds at every boot from its own jobs; a line whose program is not part of the image, lives on the RAM disk or does not exist was put there by something else, and a line that runs a program through a wrapper, a shell or command substitution hides what it runs. Lines marked medium run from the RAM disk, name a missing program, download, pipe into a shell or give a network tool a shell to run." \
 			"Find what writes each line (persistence locations=[\"cron\"] names the scripts that mention the directory) and read the program (read_file, file_hash). Remove both if they are not yours; a line in a RAM-disk crontab comes back at the next boot until its generator is gone."
 	awk -F'\t' '$1 == 0 { print $2 }' "$_cw/eval" |
-		au_add info persistence.live_crontab_firmware "medium: every program these lines run is an unchanged file of the firmware image or a shell builtin; the arguments were not judged" \
+		au_add info persistence.live_crontab_firmware "medium: every command in these lines is a simple command whose program is an unchanged file of the firmware image, a plain shell builtin, or a function of an unchanged image file the line sources; no wrapper, shell, command substitution or network tool runs anything else. What the programs do with their arguments was not judged" \
 			"Firmware jobs in a crontab outside /etc/crontabs" \
-			"The running crond reads a crontab directory other than /etc/crontabs (GL.iNet: /tmp/gl_crontabs, rebuilt at boot). These lines run only programs of the firmware image; listed so that every line crond runs is accounted for." \
+			"The running crond reads a crontab directory other than /etc/crontabs (GL.iNet: /tmp/gl_crontabs, rebuilt at boot). Each command in these lines is simple and runs a program of the firmware image directly (or a plain builtin, or a function of an image file the line sources), with nothing passed on to another program; listed so that every line crond runs is accounted for." \
 			"Nothing."
 }
 

