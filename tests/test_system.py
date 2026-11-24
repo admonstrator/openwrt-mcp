@@ -378,5 +378,147 @@ class TestLibHelpers(OpenWrtTestCase):
         self.assertGreater(int(rest.split()[-1]), 10)
 
 
+
+LIB = "sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh; . /tmp/lib.sh; "
+
+RENAME_SELF = """cat > /tmp/rename.sh <<'EOF'
+n="$1"
+echo -n "$n" > /proc/$$/comm
+sleep 300
+:
+EOF
+"""
+
+
+def redact_masks_cmdlines(tc: OpenWrtTestCase) -> bool:
+    """True when the core's redact has the command-line rule (core item C7)."""
+    out = tc.sh(LIB + "echo 'pppd plugin pppoe.so password S3cretPPP' | redact")
+    return "S3cretPPP" not in out
+
+
+class TestReviewFixes(OpenWrtTestCase):
+    """Findings of the independent review (round 3), items I1-I6."""
+
+    @needs_container
+    def test_i1_newline_in_comm(self):
+        pid = self.sh(RENAME_SELF + "(sh /tmp/rename.sh 'ab\ncd' >/dev/null 2>&1 & echo $! >/tmp/npid); sleep 1; cat /tmp/npid").strip()
+        if "ab" not in self.sh(f"cat /proc/{pid}/comm"):
+            self.skipTest("this kernel did not take the new name")
+        text = self.tool_ok("processes")
+        listing = text[text.index("== Process list"):]
+        rows = [l for l in listing.splitlines() if l.split()[:1] == [pid]]
+        self.assertEqual(len(rows), 1, text)
+        self.assertIn("ab?cd", rows[0])
+        self.assertIn("name-mismatch", rows[0])  # renamed: matches neither exe nor arguments
+        out = self.sh(LIB + "lib_procs")
+        row = [l.split("\t") for l in out.splitlines() if l.split("\t")[0] == pid]
+        self.assertEqual(len(row), 1, out)
+        self.assertEqual(row[0][7], "ab?cd")
+        self.assertEqual(len(row[0]), 10)
+        self.sh(f"kill {pid}", check=False)
+
+    @needs_container
+    def test_i2_command_line_secrets(self):
+        pid = self.sh(RENAME_SELF + "(sh /tmp/rename.sh openvpn pppd password S3cretPPP --password=S3cretTWO "
+                      ">/dev/null 2>&1 & echo $! >/tmp/cpid); sleep 1; cat /tmp/cpid").strip()
+        # pid view: one argument per line, masked by the tool itself
+        text = self.tool_ok("processes", pid=int(pid))
+        self.assertNotIn("S3cretPPP", text)
+        self.assertNotIn("S3cretTWO", text)
+        self.assertIn("password", text)
+        self.assertIn("--password=<redacted>", text)
+        if not redact_masks_cmdlines(self):
+            self.skipTest("list views rely on the core's redact command-line rule (C7), not merged yet")
+        for name, args in (("processes", {}), ("processes", {"filter": "pppd"}), ("network", {"section": "vpn"}),
+                           ("network", {}), ("services", {})):
+            text = self.tool_ok(name, **args)
+            self.assertNotIn("S3cretPPP", text, f"{name} {args}")
+        self.sh(f"kill {pid}", check=False)
+
+    @needs_container
+    def test_i2_list_views_go_through_redact(self):
+        """Independent of the core's rule: a stub redact that masks "password X" must
+        reach every command line the list views print."""
+        stub = r"""redact() { sed 's/password [^ ]*/password <stub-redacted>/g'; }"""
+        self.sh(f"cat >> /tmp/openwrt-mcp-test.sh <<'SHIM'\n{stub}\nSHIM\n"
+                "sed -i '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh && echo mcp_main >> /tmp/openwrt-mcp-test.sh")
+        try:
+            self.sh(RENAME_SELF + "(sh /tmp/rename.sh openvpn pppd password S3cretPPP >/dev/null 2>&1 &); sleep 1")
+            s = self.new_session()
+            s.initialize()
+            for name, args in (("processes", {}), ("network", {"section": "vpn"}), ("network", {"section": "dns"})):
+                text, err = s.call_tool(name, args)
+                self.assertFalse(err, text)
+                self.assertNotIn("S3cretPPP", text, f"{name} {args}")
+            text, _ = s.call_tool("processes", {})
+            self.assertIn("password <stub-redacted>", text)
+            text, _ = s.call_tool("network", {"section": "vpn"})
+            self.assertIn("password <stub-redacted>", text)
+            s.close()
+        finally:
+            self.container.push_server()
+
+    @needs_container
+    def test_i3_service_markers_not_forgeable(self):
+        fake_rom(self)
+        write_file(self, "/etc/init.d/zz_forge",
+                   "#!/bin/sh /etc/rc.common\n#@ROM 1\n#@FILE forged\nSTART=99\nUSE_PROCD=1\n"
+                   "start_service() {\n\tprocd_open_instance\n\tprocd_set_param command /tmp/zz\n\tprocd_close_instance\n}",
+                   mode="755")
+        text = self.tool_ok("services", env={"MCP_ROM": "/fixture/rom"})
+        self.assertRegex(text, r"\nzz_forge\s.*!! not in firmware image")
+        self.assertNotRegex(text, r"\nforged\s")
+        self.sh("rm -f /etc/init.d/zz_forge")
+
+    @needs_container
+    def test_i4_loaded_module_without_ko(self):
+        rel = self.sh("uname -r").strip()
+        mod = self.sh("awk 'NR == 1 { print $1 }' /proc/modules 2>/dev/null").strip()
+        if not mod:
+            self.skipTest("no loaded modules visible in this container")
+        text = self.tool_ok("kernel_modules")
+        self.assertNotIn("(built in, or loaded from elsewhere)", text)
+        self.sh(f"mkdir -p /lib/modules/{rel}")
+        text = self.tool_ok("kernel_modules")
+        self.assertRegex(text, rf"\n{mod}\s.*!! no \.ko file under /lib/modules/{re.escape(rel)}")
+        flagged = text[text.index("== Flagged"):text.index("== Loaded modules")]
+        self.assertIn(mod, flagged)
+        self.sh(f"rm -rf /lib/modules/{rel}")
+
+    @needs_container
+    def test_i5_packages_read_only(self):
+        self.sh("rm -rf /tmp/cache; ls -a /tmp > /tmp.before")
+        db = self.sh("[ -f /lib/apk/db/installed ] && echo apk || echo opkg").strip()
+        if db == "opkg":
+            # a conffile entry that is a link into /proc must not be read
+            self.sh("ln -sf /proc/self/status /etc/zz-conf && printf '\\nPackage: zz-test\\nVersion: 1\\n"
+                    "Status: install user installed\\nConffiles:\\n /etc/zz-conf 0123456789abcdef0123456789abcdef\\n\\n' "
+                    ">> /usr/lib/opkg/status")
+        text = self.tool_ok("packages", audit=True, filter="none-such")
+        after = self.sh("ls -a /tmp")
+        self.assertEqual(self.sh("cat /tmp.before"), after, "packages wrote into /tmp")
+        if db == "opkg":
+            self.assertRegex(text, r"/etc/zz-conf\s+unreadable\s+zz-test")
+            self.sh("rm -f /etc/zz-conf; awk 'BEGIN{RS=\"\"; ORS=\"\\n\\n\"} !/Package: zz-test/' /usr/lib/opkg/status "
+                    "> /tmp/st && cat /tmp/st > /usr/lib/opkg/status")
+
+    @needs_container
+    def test_i6_rom_and_upper_agree_with_forensics(self):
+        cases = [
+            ("", "mkdir -p /fixture/r6/lib", "/fixture/r6"),
+            ("", "", "/fixture/none"),
+            ("MCP_UPPER=/fixture/up6", "mkdir -p /fixture/up6", "/rom"),
+            ("MCP_UPPER=/fixture/missing", "mkdir -p /userdata/overlay/upper", "/rom"),
+            ("", "mkdir -p /userdata/overlay/upper", "/rom"),
+        ]
+        for envs, prep, rom in cases:
+            out = self.sh(f"{prep}\n{envs} MCP_ROM={rom} sh -c '" + LIB.replace("'", "'\\''") +
+                          "lib_rom_ok; echo \"rom=$?\"; echo \"upper=$(lib_upper)\"; "
+                          "fx_rom_ok; echo \"fxrom=$?\"; echo \"fxupper=$(fx_upper)\"'")
+            v = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+            self.assertEqual(v["rom"], v["fxrom"], f"{envs} {prep} {rom}: {out}")
+            self.assertEqual(v["upper"], v["fxupper"], f"{envs} {prep} {rom}: {out}")
+        self.sh("rm -rf /userdata /fixture/r6 /fixture/up6")
+
 if __name__ == "__main__":
     unittest.main()
