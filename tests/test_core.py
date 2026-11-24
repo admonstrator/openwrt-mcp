@@ -244,6 +244,128 @@ class TestLimits(OpenWrtTestCase):
         self.assertIn("still holds its output open", text)
 
 
+REDACT_CASES = [
+    # (input line, secrets that must vanish, parts that must stay)
+    ("locked:!$1$salt$hashLOCKED1:19000:0:99999:7:::", ["hashLOCKED1"], ["locked:!", "$1>", ":19000:"]),
+    ("u2:!!$6$abc$hashBANG2:19000:0:99999:7:::", ["hashBANG2"], ["u2:!!"]),
+    ("u3:*$5$x$hashSTAR3:19000:0:99999:7:::", ["hashSTAR3"], ["u3:*"]),
+    ("des:abJnggxhBDES4:19000:0:99999:7:::", ["abJnggxhBDES4"], ["des:", "DES"]),
+    ("nopw:*:19000:0:99999:7:::", [], ["nopw:*:19000:0:99999:7:::"]),
+    ("root:x:0:0:root:/root:/bin/ash", [], ["root:x:0:0:root:/root:/bin/ash"]),
+    ("keyid=guest vlanid=3 00:11:22:33:44:55 guestPSK123", ["guestPSK123"], ["keyid=guest vlanid=3 00:11:22:33:44:55"]),
+    ("00:00:00:00:00:00 defaultPSK456", ["defaultPSK456"], ["00:00:00:00:00:00"]),
+    ("33:33:00:00:00:01 dev eth0 self permanent", [], ["33:33:00:00:00:01 dev eth0 self permanent"]),
+    ("r0kh=02:01:02:03:04:05 r0kh-1.example.com 000102030405060708090a0b0c0dR0KH", ["0c0dR0KH"], ["r0kh=02:01:02:03:04:05 r0kh-1.example.com"]),
+    ("r1kh=02:01:02:03:04:05 02:11:22:33:44:55 aabbccddeeff0011223344556677R1KH", ["R1KH"], ["r1kh=02:01:02:03:04:05 02:11:22:33:44:55"]),
+    ("wireless.wifinet0.r0kh='aa,bb,uciR0KHsecret'", ["uciR0KHsecret"], ["wireless.wifinet0.r0kh="]),
+    ("\tlist r1kh 'x,y,cfgR1KHsecret'", ["cfgR1KHsecret"], ["list r1kh"]),
+    ("\toption priv_key_pwd 'privKEYPWD9'", ["privKEYPWD9"], ["option priv_key_pwd"]),
+    ("\toption pincode '12345670'", ["12345670"], ["option pincode"]),
+    ("\toption password2 'secondPW22'", ["secondPW22"], ["option password2"]),
+    ("network.wg0.private_key='WGprivBASE64='", ["WGprivBASE64"], ["network.wg0.private_key="]),
+    ("\toption public_key 'PUBvisible='", [], ["PUBvisible="]),
+    ("\toption keyid 'kid1visible'", [], ["kid1visible"]),
+    ("\toption key_mgmt 'WPA-PSK'", [], ["WPA-PSK"]),
+    ("dropbear.main.RootPasswordAuth='on'", [], ["RootPasswordAuth='on'"]),
+    ("wireless.default_radio0.ssid='home'", [], ["ssid='home'"]),
+    ("\tlist credentials 'CF_Token=cfTOKENsecret'", ["cfTOKENsecret"], ["list credentials"]),
+    ("acme.cert.credentials='CF_Token=cfTOKEN2' 'CF_Account_ID=acct2'", ["cfTOKEN2", "acct2"], ["acme.cert.credentials="]),
+    ("PRIVATE_KEY=envPRIVsecret", ["envPRIVsecret"], ["PRIVATE_KEY="]),
+    ("export API_TOKEN=apiTOKEN77", ["apiTOKEN77"], ["export API_TOKEN="]),
+    ("wpa_passphrase=wpaPASS1", ["wpaPASS1"], ["wpa_passphrase="]),
+    ("key=$1", [], ["key=$1"]),
+    ('  "key": "jsonKEYsecret",', ["jsonKEYsecret"], ['"key": ']),
+    ('  "public_key": "jsonPUBvisible",', [], ["jsonPUBvisible"]),
+    (" 1234 root /usr/sbin/pppd nodetach ipparam wan user bob password S3cretPPP mtu 1492",
+     ["S3cretPPP"], ["/usr/sbin/pppd nodetach ipparam wan user bob password", "mtu 1492"]),
+    ("/usr/bin/foo --password=dashPW1 --verbose", ["dashPW1"], ["--password=", "--verbose"]),
+    ("/usr/bin/foo --token dashTOK2 -v", ["dashTOK2"], ["--token", " -v"]),
+    ("/usr/sbin/dropbear -F -P /var/run/dropbear.1.pid -p 22 -K 300 -T 3", [],
+     ["/usr/sbin/dropbear -F -P /var/run/dropbear.1.pid -p 22 -K 300 -T 3"]),
+    ("Nov 24 dropbear[1]: Bad password attempt for 'root' from 1.2.3.4", [],
+     ["Bad password attempt for 'root' from 1.2.3.4"]),
+]
+
+
+class TestRedact(OpenWrtTestCase):
+    @needs_container
+    def test_redact_cases(self):
+        self.container.put("/tmp/redact.in", "".join(
+            line + "\n" for line, _, _ in REDACT_CASES).encode())
+        out = self.sh("sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh; . /tmp/lib.sh;"
+                      " redact < /tmp/redact.in").splitlines()
+        self.assertEqual(len(out), len(REDACT_CASES), out)
+        for (line, gone, kept), got in zip(REDACT_CASES, out):
+            with self.subTest(line=line):
+                for g in gone:
+                    self.assertNotIn(g, got)
+                for k in kept:
+                    self.assertIn(k, got)
+        # redaction off: everything passes unchanged
+        raw = self.sh("sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh; . /tmp/lib.sh;"
+                      " MCP_REDACT=0 redact < /tmp/redact.in")
+        self.assertEqual(raw, self.sh("cat /tmp/redact.in"))
+
+
+class TestCallHygiene(OpenWrtTestCase):
+    @needs_container
+    def test_work_dir_is_empty_for_every_call(self):
+        s = self.session()
+        tmp = [line.split()[-1] for line in s.call_tool("server_info")[0].splitlines()
+               if line.startswith("temp dir")][0]
+        text, _ = s.call_tool("exec", {"command": "echo stale > procs.tsv; mkdir sub; ls", "cwd": tmp + "/work"})
+        self.assertIn("procs.tsv", text)
+        text, _ = s.call_tool("exec", {"command": "ls -A | wc -l", "cwd": tmp + "/work"})
+        self.assertEqual(text.split()[0], "0", text)
+
+    @needs_container
+    def test_background_holder_keeps_earlier_output(self):
+        t0 = time.time()
+        text, err = self.session().call_tool(
+            "exec", {"command": "echo one; sleep 27 & sleep 1; echo two; echo three"})
+        self.assertLess(time.time() - t0, 20)
+        self.assertFalse(err, text)
+        body, _, note = text.partition("\n[a background process")
+        self.assertEqual(body, "one\ntwo\nthree\n\n[exit 0]")
+        self.assertIn("still holds its output open 2 s after the call ended", note)
+        self.sh("kill $(pidof sleep) 2>/dev/null; true")
+
+    @needs_container
+    def test_cap_counts_escaped_text(self):
+        s = self.session()
+        for byte, per in ((r"\001", 6), (r"\377", 3), ("q", 1)):
+            with self.subTest(byte=byte):
+                s.send_raw(json.dumps({"jsonrpc": "2.0", "id": 77, "method": "tools/call", "params": {
+                    "name": "exec", "arguments": {"command": f"head -c 200000 /dev/zero | tr '\\0' '{byte}'"}}}).encode() + b"\n")
+                raw = s.read_raw()
+                self.assertLess(len(raw), 60000 + 1000, f"result line of {len(raw)} bytes")
+                text = json.loads(raw)["result"]["content"][0]["text"]
+                body, _, note = text.partition("\n[output cut at 60000 bytes")
+                self.assertTrue(note, text[-300:])
+                self.assertEqual(len(set(body)), 1)
+                self.assertGreater(len(body) * per, 59000)
+
+    @needs_container
+    def test_rd_resolves_the_whole_path(self):
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            mkdir -p /tmp/rdt && cd /tmp/rdt && echo plain > plain.txt && ln -sfn plain.txt link.txt
+            ln -sfn /proc dirproc; ln -sfn /dev dirdev; ln -sfn /sys dirsys; ln -sfn /proc/version verlink
+            mkfifo fifo 2>/dev/null; ln -sfn fifo fifolink
+            for p in /tmp/rdt/plain.txt plain.txt link.txt /proc/version /tmp/rdt/dirproc/version                      dirproc/self/status /tmp/rdt/dirdev/zero dirsys/kernel/uevent_seqnum verlink fifo fifolink                      /tmp/rdt/dirproc/kmsg; do
+                if rd "$p" > /tmp/rdt.out; then out=$(head -c 20 /tmp/rdt.out); echo "$p ok ${out%%[!A-Za-z]*}"
+                else echo "$p refused"; fi
+            done""")
+        got = dict(line.split(" ", 1) for line in out.splitlines())
+        self.assertEqual(got["/tmp/rdt/plain.txt"], "ok plain")
+        self.assertEqual(got["plain.txt"], "ok plain")
+        self.assertEqual(got["link.txt"], "ok plain")
+        self.assertEqual(got["/proc/version"], "ok Linux")
+        for p in ("/tmp/rdt/dirproc/version", "dirproc/self/status", "/tmp/rdt/dirdev/zero",
+                  "dirsys/kernel/uevent_seqnum", "verlink", "fifo", "fifolink", "/tmp/rdt/dirproc/kmsg"):
+            self.assertEqual(got[p], "refused", p)
+
+
 class TestProtocolErrors(OpenWrtTestCase):
     @classmethod
     def setUpClass(cls):
@@ -284,10 +406,22 @@ class TestProtocolErrors(OpenWrtTestCase):
 
     def test_ids(self):
         s = self.session()
-        for i in ("x", "ä \"q\" \\ /", "", 0, -5, 1.5, 9007199254740991):
+        for i in ("x", "ä \"q\" \\ /", "", 0, -5, 123456789012345, -123456789012345):
             with self.subTest(id=i):
                 r = self.raw(s, json.dumps({"jsonrpc": "2.0", "id": i, "method": "ping"}).encode() + b"\n")
                 self.assertEqual(r["id"], i)
+        # ids that jsonfilter would re-format (1e999 -> inf, 1.50 -> 1.500000) or clamp to
+        # int64 are refused instead of being echoed wrong
+        for raw in (b"1e999", b"1.5", b"1.50", b"-2.0", b"99999999999999999999", b"1234567890123456"):
+            with self.subTest(id=raw):
+                line = b'{"jsonrpc":"2.0","id":' + raw + b',"method":"ping"}\n'
+                s.send_raw(line)
+                reply = s.read_raw()
+                r = json.loads(reply)
+                self.assertIsNone(r["id"], reply)
+                self.assertEqual(r["error"]["code"], -32600)
+                self.assertIn("at most 15 digits", r["error"]["message"])
+        self.assertEqual(s.request("ping")["result"], {})
 
     def test_notifications_get_no_reply(self):
         s = self.session()
