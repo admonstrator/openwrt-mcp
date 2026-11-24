@@ -1,12 +1,26 @@
 # openwrt-mcp
 
-An MCP server for OpenWrt routers, so that Claude (or any other MCP client) can take a
-router apart: inventory, network exposure, integrity against the firmware image,
+English | [Deutsch](README.de.md)
+
+An MCP server for OpenWrt routers. It gives Claude (or any other MCP client) tools to
+take a router apart: inventory, network exposure, integrity against the firmware image,
 persistence, accounts, and an audit with findings.
 
-It is one POSIX sh script. Nothing is installed: on every start the launcher copies the
-script over SSH to `/tmp` on the router (RAM) and runs it there. MCP goes over the SSH
-session. No port is opened and nothing is written to flash.
+## What it does
+
+You ask Claude a question about your router, such as "is anything reachable from the
+internet?" or "what changed since I flashed it?". Claude calls the tools of this server,
+the server reads the answer on the router, and Claude tells you what it found and what
+to look at first.
+
+The server is one POSIX sh script. Nothing is installed: on every start the launcher
+copies the script over SSH to `/tmp` on the router (RAM) and runs it there. MCP goes
+over the SSH session. No port is opened and nothing is written to flash.
+
+By default the server only reads. It compares what it finds with the firmware image in
+`/rom`, so it can tell which files, services and programs came with the firmware and
+which were added or changed later. With `--admin` it can also change the configuration
+(see [Admin mode](#admin-mode-configuring-the-router)).
 
 > [!WARNING]
 > The `exec` tool runs any command as root on the router. Your MCP client asks you before
@@ -22,25 +36,84 @@ session. No port is opened and nothing is written to flash.
   terminal, so it cannot ask for a password or confirm a new host key. Log in once by
   hand (`ssh root@192.168.1.1`) first.
 
-## Setup
+## Giving Claude access to the router
+
+There are two parts. The MCP server gives Claude the tools. The skill
+`openwrt-router-audit` tells Claude in which order to use them and how to read the
+results. The tools work without the skill; the audits are better with it.
+
+### 1. SSH login with a key
+
+If you still log in with a password, put your public key on the router. OpenWrt's SSH
+server (dropbear) reads root's keys from `/etc/dropbear/authorized_keys`, which is why
+`ssh-copy-id` does not work here:
 
 ```sh
-git clone <this repository> ~/openwrt-mcp
+ssh root@192.168.1.1 "tee -a /etc/dropbear/authorized_keys" < ~/.ssh/id_ed25519.pub
+```
+
+Then log in once by hand and accept the host key:
+
+```sh
+ssh root@192.168.1.1
+```
+
+### 2. Register the MCP server
+
+```sh
+git clone https://github.com/admonstrator/openwrt-mcp.git ~/openwrt-mcp
 ~/openwrt-mcp/bin/openwrt-mcp --print-config router root@192.168.1.1
 ```
 
-This prints the line for Claude Code and an `.mcp.json` entry, for example:
+This prints the line for Claude Code and an `.mcp.json` entry with the right paths.
+
+**Claude Code:** run the printed line. With `--scope user` the server is there in every
+project, not only in the current one:
 
 ```sh
-claude mcp add router -- ~/openwrt-mcp/bin/openwrt-mcp root@192.168.1.1
+claude mcp add --scope user router -- ~/openwrt-mcp/bin/openwrt-mcp root@192.168.1.1
 ```
 
-Then ask Claude something like *"Audit the router and tell me what to look at first."*
+`claude mcp list` shows whether the connection works.
+
+**Claude Desktop (macOS):** put the printed `mcpServers` entry into
+`~/Library/Application Support/Claude/claude_desktop_config.json` and restart the app.
+
+claude.ai in the browser cannot use this server: the launcher has to run on a computer
+that reaches the router over SSH.
 
 Launcher options: `-p PORT`, `-i KEY`, `-o SSH_OPTION`, `--no-redact`,
 `--max-output BYTES` (default 60000), `--call-timeout SECONDS` (default 120),
 `--admin` (write tools, see below), `--build FILE` (write the single-file server, for
 example to run it by hand).
+
+### 3. Add the skill
+
+The skill is in [.claude/skills/openwrt-router-audit](.claude/skills/openwrt-router-audit).
+
+**Claude Code:** if you start `claude` inside the cloned repository, the skill is loaded
+already. To have it in every project, copy it to your personal skills:
+
+```sh
+mkdir -p ~/.claude/skills
+cp -R ~/openwrt-mcp/.claude/skills/openwrt-router-audit ~/.claude/skills/
+```
+
+**Claude Desktop:** zip the folder and upload the file in the settings where skills are
+managed (the name of that page has changed between app versions):
+
+```sh
+cd ~/openwrt-mcp/.claude/skills && zip -r ~/openwrt-router-audit.zip openwrt-router-audit
+```
+
+The skill points to `docs/tools.md` for details. Outside the repository Claude does not
+have that file and works from the tool descriptions, which is enough for an audit.
+
+### 4. Ask
+
+*"Audit the router and tell me what to look at first."* Claude asks for permission
+before each tool call. You can allow the read-only tools permanently; leave `exec` on
+"ask every time".
 
 ## Tools
 
