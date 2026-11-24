@@ -257,3 +257,65 @@ lib_uci_dump() {
 		}'
 	fi
 }
+
+# lib_cfg_snapshot DIR: record the uci configuration (/etc/config) in DIR, one file per
+# package, so that lib_cfg_changes can show afterwards what a write tool changed. Each
+# file holds "uci -q show PACKAGE" (the raw file where uci is missing or the name has a
+# dot, which uci would read as package.section). DIR is created; keep it below the
+# call's work directory. Not redacted: lib_cfg_changes redacts what it prints.
+lib_cfg_snapshot() {
+	mkdir -p "$1" || return 1
+	for _cs_f in /etc/config/*; do
+		[ -f "$_cs_f" ] || continue
+		_cs_p=${_cs_f##*/}
+		case $_cs_p in '' | *[!A-Za-z0-9_.-]*) continue ;; esac
+		case $_cs_p in
+		*.*) rd "$_cs_f" >"$1/$_cs_p" ;;
+		*) if have uci; then uci -q show "$_cs_p" >"$1/$_cs_p" 2>/dev/null || :; else rd "$_cs_f" >"$1/$_cs_p"; fi ;;
+		esac
+	done
+	return 0
+}
+
+# lib_cfg_changes DIR [MAX]: compare the snapshot in DIR with /etc/config now and print,
+# redacted, per changed package "config PACKAGE: N removed, M added" and the lines
+# ("- " before, "+ " after; at most MAX per package, default 60). New and removed
+# packages are named. Prints "no change in /etc/config" when nothing differs. Lines
+# are compared as a multiset, so a reordered list or a renumbered anonymous section
+# (@rule[3] becomes @rule[2] after a delete) shows up as removed plus added.
+lib_cfg_changes() {
+	_cc_b=${1%/}
+	_cc_max=${2:-60}
+	_cc_a=$_cc_b.after
+	rm -rf "$_cc_a"
+	lib_cfg_snapshot "$_cc_a" || return 1
+	_cc_any=0
+	for _cc_p in $({ ls "$_cc_b"; ls "$_cc_a"; } 2>/dev/null | sort -u); do
+		if [ ! -f "$_cc_b/$_cc_p" ]; then
+			printf 'config %s: new package\n' "$_cc_p"
+			_cc_any=1
+			continue
+		fi
+		if [ ! -f "$_cc_a/$_cc_p" ]; then
+			printf 'config %s: package removed\n' "$_cc_p"
+			_cc_any=1
+			continue
+		fi
+		# removed: in before, not (as often) in after; added: the other way round.
+		# redact sees the bare lines (its uci and config patterns are anchored)
+		awk 'NR == FNR { n[$0]++; next } { if (n[$0] > 0) n[$0]--; else print }' \
+			"$_cc_a/$_cc_p" "$_cc_b/$_cc_p" | redact >"$_cc_a.rm"
+		awk 'NR == FNR { n[$0]++; next } { if (n[$0] > 0) n[$0]--; else print }' \
+			"$_cc_b/$_cc_p" "$_cc_a/$_cc_p" | redact >"$_cc_a.add"
+		[ -s "$_cc_a.rm" ] || [ -s "$_cc_a.add" ] || continue
+		_cc_any=1
+		printf 'config %s: %s removed, %s added\n' "$_cc_p" \
+			"$(wc -l <"$_cc_a.rm" | tr -d ' ')" "$(wc -l <"$_cc_a.add" | tr -d ' ')"
+		{ sed 's/^/  - /' "$_cc_a.rm"; sed 's/^/  + /' "$_cc_a.add"; } | awk -v max="$_cc_max" '
+			NR <= max { print }
+			END { if (NR > max) printf "  ... %d more lines\n", NR - max }'
+	done
+	rm -f "$_cc_a.rm" "$_cc_a.add"
+	[ "$_cc_any" = 1 ] || echo 'no change in /etc/config'
+	return 0
+}

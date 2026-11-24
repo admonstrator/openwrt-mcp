@@ -22,3 +22,16 @@
 ## Rauchprobe Phase 1
 
 Am 2026-11-24 an einem GL.iNet GL-BE14000 (Firmware 4.11.0 beta5, OpenWrt 25.12-SNAPSHOT, aarch64), nur lesende Werkzeuge, kein `exec`: alle 19 Lesewerkzeuge ohne Fehler, je 0,1 bis 6,3 s, Start 0,4 s; 123 Applets aus `/rom`; WLAN-Schlüssel und Hash maskiert; danach nichts in `/tmp` des Routers. Das Audit meldet 2 high, 1 medium, 3 low, 3 info, zu Änderungen nach dem ersten Start (Tailscale-Programme, `samba4`-Init-Skript, `cloudflared.new`, SSH-Schlüssel, nftables-Datei) und als INFO zu dem, was die Firmware beim ersten Start schrieb.
+
+## Phase 2: GL.iNet und Schreibzugriff
+
+| Nr. | Frage | Entscheidung |
+| --- | --- | --- |
+| 2.1 | Wie kommt Schreibzugriff dazu, ohne das Audit zu schwächen? | Eigener Admin-Modus: `bin/openwrt-mcp --admin` setzt `MCP_ADMIN=1` und nimmt die Module `server/NN-admin-*.sh` ins Skript; ohne `--admin` sind sie nicht einmal enthalten, und `mcp_register_admin` registriert nur im Admin-Modus. Der Admin-Server wird als eigener MCP-Eintrag registriert, der lesende bleibt, wie er ist (mit `exec` nach 1.2). |
+| 2.2 | Über welchen Weg wird geschrieben? | Beide: auf GL.iNet-Firmware die GL-API über `ubus call gl-session call` (der lokale Aufruf braucht keine Sitzung, `oui/rpc.lua` lässt `127.0.0.1` mit dem Header `glinet` durch, und die Prüfregeln der Weboberfläche greifen); auf jedem OpenWrt `uci` mit Commit und Neuladen über die Init-Skripte. |
+| 2.3 | Welche GL-Methoden darf die KI aufrufen? | Alle; riskante (in glinet-api `destructive`, dazu Methoden, die den Zugang kappen können) nur mit `confirm: true`. Die Methodenliste stammt aus github.com/admonstrator/glinet-api und gilt für die dort beschriebene Firmware; was dort fehlt, ist unbekannt und wird wie riskant behandelt, sofern es keine reine Abfrage ist. |
+| 2.4 | Was zeigt ein Schreibaufruf? | Was er in `/etc/config` geändert hat: `lib_cfg_snapshot` vorher, `lib_cfg_changes` nachher (Zeilen von `uci show`, maskiert). |
+| 2.5 | Wie liest der Server GL-Zustand? | Das lesende Werkzeug liest UCI, Dateien und `/proc`, nie die GL-API: auch Get-Methoden haben Nebenwirkungen (`tailscale.get_auth_url` startet Tailscale neu, `ddns.get_status` geht ins Netz). |
+| 2.6 | Welche Crontabs zählen? | Die, die der laufende `crond` liest: sein Verzeichnis aus `-c` (GL.iNet: `/tmp/gl_crontabs`), dazu `/etc/crontabs`. |
+| 2.7 | Gerätschlüssel von GL.iNet | `/proc/gl-hw-info/device_key` ist Schlüsselmaterial: wie andere Schlüsseldateien nie roh ausgegeben, solange maskiert wird. |
+

@@ -44,12 +44,21 @@ IMAGE = os.environ.get("OPENWRT_IMAGE", "openwrt/rootfs:x86-64-24.10.4")
 PLATFORM = os.environ.get("OPENWRT_PLATFORM", "linux/amd64")
 TARGET = os.environ.get("OPENWRT_MCP_TARGET") or None
 REMOTE_SCRIPT = "/tmp/openwrt-mcp-test.sh"
+# admin mode (write tools) for a session: tool(..., env=ADMIN_ENV). The tools that change
+# the router; requests naming one are never sent to a real router.
+ADMIN_ENV = {"MCP_ADMIN": "1"}
+ADMIN_TOOLS = ("glinet_api", "uci_change", "service_control")
 TIMEOUT = float(os.environ.get("OPENWRT_MCP_TEST_TIMEOUT", "180"))
 
 
-def build_server() -> bytes:
-    """The server exactly as the launcher ships it: server/NN-*.sh in name order."""
+def build_server(admin: bool = True) -> bytes:
+    """The server as the launcher ships it: server/NN-*.sh in name order; without admin
+    the write modules (NN-admin-*.sh) are left out, as the launcher does without --admin.
+    The containers get the admin build: the write tools still register only when a
+    session sets MCP_ADMIN=1 (ADMIN_ENV)."""
     parts = sorted((ROOT / "server").glob("[0-9][0-9]-*.sh"))
+    if not admin:
+        parts = [p for p in parts if not p.name[2:].startswith("-admin-")]
     return b"".join(p.read_bytes() for p in parts)
 
 
@@ -149,6 +158,8 @@ class Session:
         # tool is skipped before it leaves this process.
         if TARGET and b'"exec"' in data:
             raise unittest.SkipTest("exec is never run against a real router")
+        if TARGET and any(b'"%s"' % t.encode() in data for t in ADMIN_TOOLS):
+            raise unittest.SkipTest("write tools are never run against a real router")
         self.proc.stdin.write(data)
         self.proc.stdin.flush()
 
@@ -242,6 +253,8 @@ class OpenWrtTestCase(unittest.TestCase):
             cmd = [str(ROOT / "bin" / "openwrt-mcp"), TARGET]
             if env.get("MCP_REDACT") == "0":
                 cmd.insert(1, "--no-redact")
+            if env.get("MCP_ADMIN") == "1":
+                cmd.insert(1, "--admin")
         else:
             cmd = self.container.server_cmd(env)
         return Session(cmd)

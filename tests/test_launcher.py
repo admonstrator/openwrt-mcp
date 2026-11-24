@@ -29,7 +29,12 @@ class TestLauncherLocal(unittest.TestCase):
             out = pathlib.Path(d) / "server.sh"
             r = run("--build", str(out))
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(out.read_bytes(), build_server())
+            self.assertEqual(out.read_bytes(), build_server(admin=False))
+            self.assertNotIn(b"# admin module:", out.read_bytes())
+            r = run("--admin", "--build", str(out))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(out.read_bytes(), build_server(admin=True))
+            self.assertIn(b"# admin module:", out.read_bytes())
 
     def test_usage_errors(self):
         for args in ((), ("--bogus", "host"), ("-p",), ("--max-output", "x", "host"),
@@ -40,7 +45,7 @@ class TestLauncherLocal(unittest.TestCase):
         r = run("--help")
         self.assertEqual(r.returncode, 0)
         for opt in ("-p PORT", "-i KEY", "-o OPTION", "--no-redact", "--max-output", "--call-timeout",
-                    "--build FILE", "--print-config NAME"):
+                    "--build FILE", "--print-config NAME", "--admin"):
             self.assertIn(opt, r.stdout)
 
     def test_print_config(self):
@@ -48,10 +53,10 @@ class TestLauncherLocal(unittest.TestCase):
             key = pathlib.Path(d) / "my key"
             key.write_text("x")
             r = run("-p", "2222", "-i", "my key", "-o", "ConnectTimeout=5", "--no-redact",
-                    "--max-output", "9000", "--print-config", "my router", "root@192.168.8.1", cwd=d)
+                    "--max-output", "9000", "--admin", "--print-config", "my router", "root@192.168.8.1", cwd=d)
         self.assertEqual(r.returncode, 0, r.stderr)
         want_args = ["-p", "2222", "-i", str(key.resolve()), "-o", "ConnectTimeout=5", "--no-redact",
-                     "--max-output", "9000", "root@192.168.8.1"]
+                     "--max-output", "9000", "--admin", "root@192.168.8.1"]
         cmd_line = [x for x in r.stdout.splitlines() if x.startswith("claude mcp add")][0]
         self.assertEqual(shlex.split(cmd_line), ["claude", "mcp", "add", "my router", "--",
                                                  os.path.realpath(LAUNCHER), *want_args])

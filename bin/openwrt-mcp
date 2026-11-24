@@ -9,6 +9,8 @@
 #   --no-redact          do not mask secrets (Wi-Fi keys, password hashes, private keys)
 #   --max-output N       bytes per tool result (default 60000)
 #   --call-timeout N     seconds per tool call (default 120)
+#   --admin              also offer the write tools (server/NN-admin-*.sh); register
+#                        this as its own MCP server, apart from the read-only one
 #   --build FILE         write the joined server script to FILE and exit
 #   --print-config NAME  print the "claude mcp add" line and an .mcp.json entry for
 #                        the other options given, and exit
@@ -30,9 +32,9 @@ while [[ -L $self ]]; do
 done
 self=$(cd "$(dirname "$self")" && pwd -P)/$(basename "$self")
 srcdir=$(dirname "$self")/../server
-ssh_opts=() env=(MCP_SELF_DELETE=1) build='' config_name='' passthru=()
+ssh_opts=() env=(MCP_SELF_DELETE=1) build='' config_name='' passthru=() admin=0
 
-usage() { sed -n '3,22s/^# \{0,1\}//p' "$self"; }
+usage() { sed -n '3,24s/^# \{0,1\}//p' "$self"; }
 die() { printf 'openwrt-mcp: %s\n' "$1" >&2; exit "${2:-1}"; }
 need() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value" 2; }
 
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
 		ssh_opts+=(-i "$key"); passthru+=(-i "$key"); shift ;;
 	-o) need "$@"; ssh_opts+=(-o "$2"); passthru+=(-o "$2"); shift ;;
 	--no-redact) env+=(MCP_REDACT=0); passthru+=(--no-redact) ;;
+	--admin) admin=1; env+=(MCP_ADMIN=1); passthru+=(--admin) ;;
 	--max-output | --call-timeout)
 		need "$@"
 		[[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 needs a positive number" 2
@@ -62,7 +65,15 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
-joined() { cat "$srcdir"/[0-9][0-9]-*.sh; }
+# the modules in name order; the write tools (NN-admin-*.sh) only with --admin, so the
+# read-only server does not even carry their code
+joined() {
+	local f
+	for f in "$srcdir"/[0-9][0-9]-*.sh; do
+		[[ $admin == 1 || ${f##*/} != [0-9][0-9]-admin-*.sh ]] || continue
+		cat "$f"
+	done
+}
 
 if [[ -n $build ]]; then joined >"$build"; exit 0; fi
 if [[ $# -ne 1 ]]; then usage >&2; exit 2; fi

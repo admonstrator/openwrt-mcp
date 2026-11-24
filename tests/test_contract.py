@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from mcp_client import OpenWrtTestCase, needs_container
+from mcp_client import ADMIN_ENV, ADMIN_TOOLS, OpenWrtTestCase, needs_container
 
 # the core helpers, called from a throwaway tool module that tests add to the server
 HELPER_SHIM = r"""
@@ -125,6 +125,71 @@ class TestHelpers(OpenWrtTestCase):
             f = line.split("\t")
             self.assertEqual(len(f), 9, line)
             self.assertIn(f[0], ("tcp", "tcp6", "udp", "udp6", "raw", "raw6"))
+
+
+ADMIN_SHIM = r"""
+mcp_register_admin t_admin <<'EOF'
+{"name":"t_admin","description":"test","inputSchema":{"type":"object"}}
+EOF
+tool_t_admin() { echo changed; }
+"""
+
+
+class TestAdminMode(OpenWrtTestCase):
+    def test_read_only_by_default(self):
+        names = [t["name"] for t in self.session().request("tools/list")["result"]["tools"]]
+        for t in ADMIN_TOOLS:
+            self.assertNotIn(t, names)
+        self.assertIn("mode          read-only (no write tools)", self.tool_ok("server_info"))
+
+    @needs_container
+    def test_admin_registration(self):
+        self.sh(f"cat >> /tmp/openwrt-mcp-test.sh <<'SHIM'\n{ADMIN_SHIM}\nSHIM\n"
+                "sed -i '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh && echo mcp_main >> /tmp/openwrt-mcp-test.sh")
+        try:
+            for env, on in (({}, False), ({"MCP_ADMIN": "yes"}, False), (ADMIN_ENV, True)):
+                with self.subTest(env=env):
+                    s = self.new_session(env)
+                    r = s.initialize()
+                    names = [t["name"] for t in s.request("tools/list")["result"]["tools"]]
+                    self.assertEqual("t_admin" in names, on)
+                    self.assertEqual(r["result"]["serverInfo"]["title"], "OpenWrt (admin)" if on else "OpenWrt")
+                    self.assertEqual("Admin mode" in r["result"]["instructions"], on)
+                    if on:
+                        self.assertEqual(s.call_tool("t_admin")[0].strip(), "changed")
+                        self.assertIn("admin (write tools on)", s.call_tool("server_info")[0])
+                    else:
+                        r = s.request("tools/call", {"name": "t_admin", "arguments": {}})
+                        self.assertEqual(r["error"]["code"], -32602)
+                    s.close()
+        finally:
+            self.container.push_server()
+
+    @needs_container
+    def test_cfg_changes(self):
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            mkdir -p /tmp/cc && cd /tmp/cc && rm -rf snap snap.after
+            printf "config t 'a'\n\toption name 'one'\n\toption key 'hunter2'\n\tlist l 'x'\n" > /etc/config/zztest
+            lib_cfg_snapshot snap
+            lib_cfg_changes snap; echo ==
+            uci set zztest.a.name=two; uci set zztest.a.key=s3cret; uci add_list zztest.a.l=y
+            uci set zztest.b=t; uci commit zztest
+            printf "config x\n" > /etc/config/zznew
+            lib_cfg_changes snap; echo ==
+            lib_cfg_changes snap 2
+            rm -f /etc/config/zztest /etc/config/zznew""")
+        first, second, third = out.split("==\n")
+        self.assertEqual(first.strip(), "no change in /etc/config")
+        self.assertIn("config zztest: 3 removed, 4 added", second)
+        self.assertIn("  - zztest.a.name='one'", second)
+        self.assertIn("  + zztest.a.name='two'", second)
+        self.assertIn("  + zztest.b=t", second)
+        self.assertIn("config zznew: new package", second)
+        self.assertNotIn("hunter2", second)
+        self.assertNotIn("s3cret", second)
+        self.assertIn("zztest.a.key='<redacted>'", second)
+        self.assertIn("  ... 5 more lines", third)
 
 
 if __name__ == "__main__":

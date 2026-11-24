@@ -12,6 +12,13 @@
 #   EOF                              and annotations. Tools are listed in registration
 #                                    order, so in file order.
 #
+#   mcp_register_admin NAME <<'EOF'  the same for a tool that changes the router: it is
+#   ...                              registered only in admin mode (MCP_ADMIN=1, launcher
+#   EOF                              --admin); otherwise its definition is read and
+#                                    dropped and a call is "Unknown tool". Such tools
+#                                    live in server/NN-admin-*.sh, which the launcher
+#                                    leaves out of the script unless --admin is given.
+#
 #   tool_NAME() { ...; }             the handler. It writes plain text to stdout (stderr
 #                                    is merged into it), never reads stdin (it is
 #                                    /dev/null) and returns 0. A non-zero return, or
@@ -43,7 +50,7 @@
 #   lib_sockets                      (server/05-lib.sh) one TSV line per socket
 #
 # Globals a handler may read: MCP_TMP (private temp dir, cleaned on exit), MCP_ROM,
-# MCP_UPPER, MCP_REDACT, MCP_TRUSTED, MCP_MAX_OUTPUT, MCP_SERVER_VERSION.
+# MCP_UPPER, MCP_REDACT, MCP_TRUSTED, MCP_MAX_OUTPUT, MCP_SERVER_VERSION, MCP_ADMIN.
 #
 # Environment knobs (set by the launcher or the tests):
 #   MCP_ROM            firmware image root        default /rom
@@ -54,6 +61,7 @@
 #   MCP_SELF_DELETE    1 removes this script file after start (launcher sets it)
 #   MCP_DEBUG          1 logs requests to stderr
 #   MCP_PROC           proc root for the audit's process checks (tests)  default /proc
+#   MCP_ADMIN          1 registers the write tools (admin mode)           default 0
 #
 # ---------------------------------------------------------------- how a call runs
 # The arguments are checked against the tool's inputSchema first (unknown names, JSON
@@ -80,6 +88,7 @@ MCP_PROTOCOLS="2025-11-25 2025-06-18 2025-03-26 2024-11-05"
 : "${MCP_CALL_TIMEOUT:=120}"
 : "${MCP_SELF_DELETE:=0}"
 : "${MCP_DEBUG:=0}"
+[ "${MCP_ADMIN:-0}" = 1 ] || MCP_ADMIN=0
 case $MCP_MAX_OUTPUT in '' | *[!0-9]* | 0* | ??????????*) MCP_MAX_OUTPUT=60000 ;; esac
 case $MCP_CALL_TIMEOUT in '' | *[!0-9]* | 0* | ??????*) MCP_CALL_TIMEOUT=120 ;; esac
 
@@ -654,6 +663,9 @@ mcp_register() {
 	cat >"$MCP_TMP/tools/$(printf '%03d' "$_mcp_ntools")-$1.json"
 	MCP_TOOLS="$MCP_TOOLS $1"
 }
+mcp_register_admin() {
+	if [ "$MCP_ADMIN" = 1 ]; then mcp_register "$1"; else cat >/dev/null; fi
+}
 
 # ---------------------------------------------------------------- protocol
 _mcp_send() { printf '%s\n' "$1" >&3; }
@@ -666,8 +678,15 @@ _mcp_initialize() { # ID
 	_want=$(_mcp_jf -e @.params.protocolVersion)
 	_proto=${MCP_PROTOCOLS%% *}
 	for _p in $MCP_PROTOCOLS; do [ "$_p" = "$_want" ] && _proto=$_want; done
-	_instr="Read-only tools for inspecting an OpenWrt router; start with system_info and audit. Tools run with the firmware image's busybox first in PATH when /rom has one ($MCP_TRUSTED). Output over $MCP_MAX_OUTPUT bytes is cut and a call is stopped after $MCP_CALL_TIMEOUT s. Secrets are masked unless the launcher was started with --no-redact (now: MCP_REDACT=$MCP_REDACT). The exec tool runs any shell command as root: prefer the dedicated tools."
-	_mcp_send "{\"jsonrpc\":\"2.0\",\"id\":$1,\"result\":{\"protocolVersion\":\"$_proto\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"$MCP_SERVER_NAME\",\"title\":\"OpenWrt\",\"version\":\"$MCP_SERVER_VERSION\"},\"instructions\":$(json_quote "$_instr")}}"
+	if [ "$MCP_ADMIN" = 1 ]; then
+		_instr="Admin mode: tools for inspecting AND configuring an OpenWrt router. The read-only tools are the same as on the audit server; the write tools change the running router. Before a change, read the current state with the read-only tools, tell the user what you are about to change and why, change one thing at a time and check the result. Calls marked risky (they can cut off access, reboot, reset or flash the router) need confirm=true, which you set only after the user agreed to that exact call. Never change a router you suspect to be compromised: audit it with the read-only server instead."
+		_title='OpenWrt (admin)'
+	else
+		_instr='Read-only tools for inspecting an OpenWrt router; start with system_info and audit.'
+		_title=OpenWrt
+	fi
+	_instr="$_instr Tools run with the firmware image's busybox first in PATH when /rom has one ($MCP_TRUSTED). Output over $MCP_MAX_OUTPUT bytes is cut and a call is stopped after $MCP_CALL_TIMEOUT s. Secrets are masked unless the launcher was started with --no-redact (now: MCP_REDACT=$MCP_REDACT). The exec tool runs any shell command as root: prefer the dedicated tools."
+	_mcp_send "{\"jsonrpc\":\"2.0\",\"id\":$1,\"result\":{\"protocolVersion\":\"$_proto\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"$MCP_SERVER_NAME\",\"title\":\"$_title\",\"version\":\"$MCP_SERVER_VERSION\"},\"instructions\":$(json_quote "$_instr")}}"
 }
 
 _mcp_tools_list() { # ID
@@ -862,6 +881,7 @@ EOF
 tool_server_info() {
 	printf 'server        %s %s\n' "$MCP_SERVER_NAME" "$MCP_SERVER_VERSION"
 	printf 'protocols     %s\n' "$MCP_PROTOCOLS"
+	printf 'mode          %s\n' "$([ "$MCP_ADMIN" = 1 ] && echo 'admin (write tools on)' || echo 'read-only (no write tools)')"
 	printf 'trusted tools %s\n' "$MCP_TRUSTED"
 	printf 'redaction     %s\n' "$([ "$MCP_REDACT" = 1 ] && echo on || echo off)"
 	printf 'max output    %s bytes per result (more is cut while the tool runs)\n' "$MCP_MAX_OUTPUT"

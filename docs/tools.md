@@ -128,6 +128,7 @@ JSON-RPC 2.0, one message per line on stdin and stdout (MCP stdio transport). Me
 | `MCP_CALL_TIMEOUT` | `120` | seconds per call (launcher `--call-timeout`) |
 | `MCP_SELF_DELETE` | `0` | `1`: the script removes itself from /tmp at start (launcher sets it) |
 | `MCP_DEBUG` | `0` | `1`: log requests to stderr |
+| `MCP_ADMIN` | `0` | `1`: admin mode, the write tools of section 5 are registered (launcher `--admin`); any other value is `0` |
 
 Invalid numbers fall back to the default. Set by the server for every process of a call:
 `MCP_CALL_TAG` (internal, for the timeout).
@@ -162,6 +163,7 @@ openwrt-mcp [options] [user@]HOST
   --no-redact          MCP_REDACT=0
   --max-output N       MCP_MAX_OUTPUT=N
   --call-timeout N     MCP_CALL_TIMEOUT=N
+  --admin              MCP_ADMIN=1, and the script includes server/NN-admin-*.sh
   --build FILE         write the joined server script to FILE and exit
   --print-config NAME  print "claude mcp add NAME -- <launcher> <options> HOST" and an
                        .mcp.json entry, and exit
@@ -503,3 +505,32 @@ not repeated for a rule.
 `MCP_PROC` (default `/proc`) is where the process checks read exe links, environments
 and the module list. It exists for the tests, because in an emulated container every
 `/proc/PID/exe` points at the emulator; sockets always come from the real `/proc`.
+
+## 5 Admin mode: write tools
+
+(server/60-admin-glinet.sh, server/65-admin-uci.sh; core support in server/00-core.sh,
+server/05-lib.sh, bin/openwrt-mcp)
+
+Only with launcher `--admin` (`MCP_ADMIN=1`): the script then includes the modules
+`server/NN-admin-*.sh`, and their tools are registered with `mcp_register_admin`.
+Without it the server is the read-only one of sections 1 to 4, and a call to a write
+tool is "Unknown tool". Register the admin server as its own MCP server (for example
+`router-admin`), so the read-only one keeps its permissions. In admin mode
+`initialize` says so in its instructions (read first, one change at a time, `confirm`
+only after the user agreed), `serverInfo.title` is `OpenWrt (admin)` and `server_info`
+prints `mode admin (write tools on)`.
+
+Write tools report what they changed in `/etc/config`: `lib_cfg_snapshot DIR` records
+`uci show` of every package before the change, `lib_cfg_changes DIR [MAX]` prints per
+changed package `config PKG: N removed, M added` and the lines (`- ` before, `+ ` after,
+at most MAX, default 60), redacted, or `no change in /etc/config`. Lines are compared as
+a multiset: a renumbered anonymous section shows up as removed plus added.
+
+### glinet_api
+
+(written by the owner of server/60-admin-glinet.sh)
+
+### uci_change and service_control
+
+(written by the owner of server/65-admin-uci.sh)
+
