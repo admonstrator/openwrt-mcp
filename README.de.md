@@ -1,6 +1,23 @@
-# openwrt-mcp
+<div align="center">
 
-[English](README.md) | Deutsch
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./images/logo-dark.png">
+  <img src="./images/logo.png" alt="OpenWrt MCP" width="480">
+</picture>
+
+<h1>openwrt-mcp</h1>
+
+Ein MCP-Server, mit dem Claude OpenWrt- und GL.iNet-Router untersuchen, prüfen und konfigurieren kann.
+
+[![Tests](https://img.shields.io/github/actions/workflow/status/admonstrator/openwrt-mcp/tests.yml?branch=main&style=for-the-badge&logo=githubactions&label=Tests)](https://github.com/admonstrator/openwrt-mcp/actions/workflows/tests.yml) [![License](https://img.shields.io/github/license/admonstrator/openwrt-mcp?style=for-the-badge&color=0ea5e9)](LICENSE) [![OpenWrt](https://img.shields.io/badge/OpenWrt-21.02%20to%2025.12-10b981?style=for-the-badge&logo=openwrt)](#voraussetzungen)
+
+[English](README.md) · Deutsch
+
+[Was der Server tut](#was-der-server-tut) · [Einrichtung](#claude-zugriff-auf-den-router-geben) · [Werkzeuge](#werkzeuge) · [Admin-Modus](#admin-modus-den-router-konfigurieren) · [Sicherheit](#sicherheit) · [Grenzen](#grenzen)
+
+</div>
+
+---
 
 Ein MCP-Server für OpenWrt-Router. Er gibt Claude (oder jedem anderen MCP-Client)
 Werkzeuge, mit denen sich ein Router untersuchen lässt: Bestandsaufnahme, was aus dem

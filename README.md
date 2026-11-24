@@ -1,6 +1,23 @@
-# openwrt-mcp
+<div align="center">
 
-English | [Deutsch](README.de.md)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./images/logo-dark.png">
+  <img src="./images/logo.png" alt="OpenWrt MCP" width="480">
+</picture>
+
+<h1>openwrt-mcp</h1>
+
+An MCP server that lets Claude inspect, audit and configure OpenWrt and GL.iNet routers.
+
+[![Tests](https://img.shields.io/github/actions/workflow/status/admonstrator/openwrt-mcp/tests.yml?branch=main&style=for-the-badge&logo=githubactions&label=Tests)](https://github.com/admonstrator/openwrt-mcp/actions/workflows/tests.yml) [![License](https://img.shields.io/github/license/admonstrator/openwrt-mcp?style=for-the-badge&color=0ea5e9)](LICENSE) [![OpenWrt](https://img.shields.io/badge/OpenWrt-21.02%20to%2025.12-10b981?style=for-the-badge&logo=openwrt)](#requirements)
+
+English · [Deutsch](README.de.md)
+
+[What it does](#what-it-does) · [Setup](#giving-claude-access-to-the-router) · [Tools](#tools) · [Admin mode](#admin-mode-configuring-the-router) · [Safety](#safety) · [Limits](#limits)
+
+</div>
+
+---
 
 An MCP server for OpenWrt routers. It gives Claude (or any other MCP client) tools to
 take a router apart: inventory, network exposure, integrity against the firmware image,
