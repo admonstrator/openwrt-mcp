@@ -57,6 +57,19 @@ function fx_oct(s,   v, c) {
 	c = substr(s, 10, 1); if (c == "x" || c == "t") v += 1; if (c == "t" || c == "T") v += 512
 	return sprintf("%04o", v)
 }
+# A link target as an absolute path without "." and "..": "busybox" in /bin and
+# "/bin/busybox" are the same target.
+function fx_resolve(link, t,   n, a, i, m, o, out) {
+	if (substr(t, 1, 1) != "/") { sub(/\/[^\/]*$/, "", link); t = link "/" t }
+	n = split(t, a, "/"); m = 0
+	for (i = 1; i <= n; i++) {
+		if (a[i] == "" || a[i] == ".") continue
+		if (a[i] == "..") { if (m > 0) m--; continue }
+		o[++m] = a[i]
+	}
+	out = ""; for (i = 1; i <= m; i++) out = out "/" o[i]
+	return (out == "") ? "/" : out
+}
 function fx_ls(line,   h, n, f, r, i) {
 	if (!match(line, / [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [+-][0-9][0-9][0-9][0-9] /)) return 0
 	h = substr(line, 1, RSTART - 1); F_mtime = substr(line, RSTART + 1, 19); r = substr(line, RSTART + RLENGTH)
@@ -164,7 +177,7 @@ fx_cmp() {
 			if (cc != 1) st = "noimage"
 			else if (!(k in rt)) st = "new"
 			else if (rt[k] != F_type) { st = "changed"; d = "image: " desc(rt[k], rs[k], rm[k], rg[k]) }
-			else if (F_type == "l") { if (rg[k] != F_target) { st = "changed"; d = "image: -> " rg[k] } }
+			else if (F_type == "l") { if (fx_resolve(k, rg[k]) != fx_resolve(k, F_target)) { st = "changed"; d = "image: -> " rg[k] } }
 			else if (F_type == "f") {
 				if (rs[k] != F_size) { st = "changed"; d = "image: " rs[k] " bytes" }
 				else if (F_size != "0") {
@@ -238,6 +251,64 @@ fx_pkg() {
 			print $0, p, q
 		}' "$_pt.l" "$_pt.r" -
 	rm -f "$_pt.l" "$_pt.r"
+}
+
+# ---------------------------------------------------------------- first boot
+# What the firmware writes at its first boot looks like a change against the image, and
+# is none. It can be told apart by time: OpenWrt has no clock at first boot, sysfixtime
+# sets it to the newest file below /etc of the image, and it runs from there until NTP
+# answers. So everything the first-boot scripts (uci-defaults) write is dated within
+# minutes after the newest file of $MCP_ROM/etc, while a later change carries the real
+# date, which lies after the day the firmware was installed.
+#
+# fx_fbwindow prints "START<TAB>END" (ls time format): the newest file below
+# $MCP_ROM/etc and one hour later. It fails when there is no image, or when the clock
+# of the device is itself inside the window (not yet set): then nothing can be told.
+FX_FB_SECONDS=3600
+fx_fbwindow() {
+	fx_rom_ok || return 1
+	_fb0=$(find "${MCP_ROM%/}/etc" -xdev -type f -print0 2>/dev/null | fx_ls |
+		awk "$FX_AWK_LS"'{ if (fx_ls($0) && F_mtime > m) m = F_mtime } END { print m }')
+	[ -n "$_fb0" ] || return 1
+	_fbs=$(date -d "$_fb0" +%s 2>/dev/null) || return 1
+	[ "$(date +%s)" -gt $((_fbs + FX_FB_SECONDS)) ] || return 1
+	printf '%s\t%s\n' "$_fb0" "$(date -d "@$((_fbs + FX_FB_SECONDS))" '+%Y-%m-%d %H:%M:%S')"
+}
+
+# fx_firstboot ROOT: filter. Appends one field to fx_cmp/fx_pkg records: "firstboot"
+# when the entry was written in the first-boot window, else "-". Both times must lie in
+# the window: the mtime, and the ctime, which touch cannot set (only a changed system
+# clock can). MCP_FIRSTBOOT_CTIME=0 judges by mtime alone; it exists for the tests, which
+# cannot create a file with an old ctime.
+: "${MCP_FIRSTBOOT_CTIME:=1}"
+fx_firstboot() {
+	_ft=$MCP_TMP/fb.$$
+	cat >"$_ft.in"
+	: >"$_ft.c"
+	if _fw=$(fx_fbwindow); then
+		_f0=${_fw%%"$FX_TAB"*}
+		_f1=${_fw#*"$FX_TAB"}
+		if [ "$MCP_FIRSTBOOT_CTIME" = 1 ]; then
+			# shellcheck disable=SC2012
+			FX_ROOT=${1%/} awk -F'\t' -v a="$_f0" -v b="$_f1" '$8 >= a && $8 <= b { print ENVIRON["FX_ROOT"] $9 }' "$_ft.in" |
+				tr '\n' '\0' | xargs -0 -r ls -lndc --full-time 2>/dev/null >"$_ft.c"
+		fi
+	else
+		_f0=
+		_f1=
+	fi
+	FX_ROOT=${1%/} FX_C="$_ft.c" awk -F'\t' -v a="$_f0" -v b="$_f1" -v usec="$MCP_FIRSTBOOT_CTIME" "$FX_AWK_LS"'
+		BEGIN { OFS = "\t"; ll = length(ENVIRON["FX_ROOT"]) }
+		FILENAME == ENVIRON["FX_C"] { if (fx_ls($0)) ct[substr(F_path, ll + 1)] = F_mtime; next }
+		{
+			fb = "-"
+			if (a != "" && $8 >= a && $8 <= b) {
+				if (usec != 1) fb = "firstboot"
+				else if (($9 in ct) && ct[$9] >= a && ct[$9] <= b) fb = "firstboot"
+			}
+			print $0, fb
+		}' "$_ft.c" "$_ft.in"
+	rm -f "$_ft.in" "$_ft.c"
 }
 
 # fx_path VAR ARGNAME [DEFAULT]: an absolute path argument without trailing slashes.
