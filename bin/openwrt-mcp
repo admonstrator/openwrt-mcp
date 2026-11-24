@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# openwrt-mcp - start the OpenWrt MCP server on a router over SSH
+#
+#   openwrt-mcp [options] [user@]HOST
+#
+#   -p PORT          SSH port
+#   -i KEY           SSH identity file
+#   -o OPTION        extra ssh -o option (repeatable)
+#   --no-redact      do not mask secrets (Wi-Fi keys, password hashes, private keys)
+#   --max-output N   bytes per tool result (default 60000)
+#   --build FILE     write the joined server script to FILE and exit
+#   -h, --help       this help
+#
+# Copies the server to /tmp on the router (RAM) and speaks MCP over SSH's stdio.
+# Register it with Claude Code:  claude mcp add router -- /path/to/openwrt-mcp root@192.168.1.1
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+srcdir=$here/../server
+ssh_opts=() env=(MCP_SELF_DELETE=1) build=
+
+usage() { sed -n '2,15s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+	-p) ssh_opts+=(-p "$2"); shift ;;
+	-i) ssh_opts+=(-i "$2"); shift ;;
+	-o) ssh_opts+=(-o "$2"); shift ;;
+	--no-redact) env+=(MCP_REDACT=0) ;;
+	--max-output) [[ $2 =~ ^[0-9]+$ ]] || { echo "--max-output needs a number" >&2; exit 2; }; env+=("MCP_MAX_OUTPUT=$2"); shift ;;
+	--build) build=$2; shift ;;
+	-h | --help) usage; exit 0 ;;
+	-*) echo "unknown option: $1" >&2; exit 2 ;;
+	*) break ;;
+	esac
+	shift
+done
+
+joined() { cat "$srcdir"/[0-9][0-9]-*.sh; }
+
+if [[ -n $build ]]; then joined >"$build"; exit 0; fi
+[[ $# -eq 1 ]] || { usage >&2; exit 2; }
+target=$1
+
+remote=/tmp/openwrt-mcp-$$.sh
+joined | ssh -T "${ssh_opts[@]+"${ssh_opts[@]}"}" -o BatchMode=yes "$target" "cat > $remote"
+exec ssh -T "${ssh_opts[@]+"${ssh_opts[@]}"}" -o BatchMode=yes "$target" "${env[*]} exec sh $remote"
