@@ -554,7 +554,14 @@ _mcp_tools_call() { # ID
 	_mcp_tag="$$.$_mcp_ncall."
 	_ct_fifo=$MCP_TMP/pipe
 	rm -f "$_ct_fifo" "$_out" "$MCP_TMP/cut"
-	mkfifo "$_ct_fifo" 2>/dev/null || mknod "$_ct_fifo" p
+	mkfifo "$_ct_fifo" 2>/dev/null || mknod "$_ct_fifo" p 2>/dev/null
+	if [ ! -p "$_ct_fifo" ]; then
+		echo "error: cannot create a FIFO in $MCP_TMP (is /tmp full?)" >"$_out"
+		_mcp_result "$1" true 0 ""
+		rm -f "$_out" "$_ct_fifo"
+		_mcp_tag=''
+		return
+	fi
 	# producer: the handler, writing into the FIFO
 	(
 		MCP_CALL_TAG=$_mcp_tag

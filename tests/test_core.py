@@ -179,6 +179,22 @@ class TestLimits(OpenWrtTestCase):
         self.assertEqual(live(self.container.procs(), "sleep 921"), [])
 
     @needs_container
+    def test_run_timeout_does_not_hold_pipes(self):
+        # the watchdog must not keep a $(...) or a pipe open until the limit
+        out = self.sh(r"""sed '/^mcp_main$/d' /tmp/openwrt-mcp-test.sh > /tmp/lib.sh
+            . /tmp/lib.sh
+            s=$(date +%s)
+            x=$(run_timeout 30 sh -c 'echo fast')
+            run_timeout 30 echo piped | cat
+            y=$(run_timeout 30 echo sub | awk '{print "awk:" $0}')
+            echo "$x $y $(( $(date +%s) - s ))"
+            """)
+        lines = out.split()
+        self.assertEqual(lines[:3], ["piped", "fast", "awk:sub"])
+        self.assertLess(int(lines[3]), 10, "run_timeout held a pipe open")
+        self.assertEqual(live(self.container.procs(), "sleep 30"), [])
+
+    @needs_container
     def test_call_timeout(self):
         env = {"MCP_CALL_TIMEOUT": "3"}
         s = self.session(env)
