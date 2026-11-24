@@ -13,6 +13,9 @@ FX_TAB=$(printf '\t')
 
 # Whether the firmware image is usable (lib_rom_ok) and where the overlay's upper
 # directory is (lib_upper) comes from server/05-lib.sh, shared with the inventory tools.
+# The old names stay as aliases: tests/test_system.py compares both pairs.
+fx_rom_ok() { lib_rom_ok; }
+fx_upper() { lib_upper; }
 
 # awk library: fx_ls(line) parses one "ls -lnd --full-time" line into F_type (f d l c b
 # p s), F_mode (octal), F_uid, F_gid, F_size (devices: "major,minor"), F_mtime, F_path,

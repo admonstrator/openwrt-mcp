@@ -391,14 +391,19 @@ class TestReviewFindings(FilesFixture):
             self.sh("rm -f /usr/lib/opkg/info/zz.list")
 
     def test_fifo_in_place_of_a_system_file_does_not_hang(self):
-        # F5: /etc/group and /etc/passwd were read without a regular-file check
-        self.sh("mv /etc/group /etc/group.real && mkfifo /etc/group")
+        # F5: /etc/group and /etc/passwd were read without a regular-file check.
+        # The FIFO is made and removed through the running server: "docker exec" reads
+        # /etc/group itself and would hang on the FIFO.
+        s = self.session(ROM)
+        s.call_tool("exec", {"command": "mv /etc/group /etc/group.real && mkfifo /etc/group"})
         try:
-            text, err = self.tool("list_dir", ROM, timeout=40, path="/fx")
+            text, err = s.call_tool("list_dir", {"path": "/fx"}, 40)
             self.assertFalse(err, text)
             self.assertIn("/fx/text.txt", text)
+            self.assertRegex(text, r"f 0644 root:0 +4392 .* /fx/text\.txt")  # no group names without the file
         finally:
-            self.sh("rm -f /etc/group && mv /etc/group.real /etc/group")
+            s.call_tool("exec", {"command": "rm -f /etc/group && mv /etc/group.real /etc/group"})
+            self.assertIn("root", self.sh("head -n 1 /etc/group"))
 
     def test_hex_view_without_hexdump_is_an_error(self):
         # F10
