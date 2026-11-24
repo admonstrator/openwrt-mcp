@@ -100,6 +100,15 @@ class TestExec(OpenWrtTestCase):
         self.assertIn("not found", text)
         self.assertNotIn("/tmp/openwrt-mcp.", text)
 
+        # the image's jsonfilter is used too when it works
+        self.sh("mkdir -p /fixture/rom2/bin /fixture/rom2/usr/bin && cp /fixture/rom/bin/busybox /fixture/rom2/bin/"
+                " && cp /usr/bin/jsonfilter /fixture/rom2/usr/bin/")
+        env2 = {"MCP_ROM": "/fixture/rom2"}
+        info, _ = self.session(env2).call_tool("server_info")
+        self.assertIn("trusted tools yes (/fixture/rom2/bin/busybox, /fixture/rom2/usr/bin/jsonfilter)", info)
+        text, _ = self.run_exec(env2, command="readlink $(command -v jsonfilter)")
+        self.assertIn("/fixture/rom2/usr/bin/jsonfilter\n", text)
+
         # without a firmware busybox both settings use the normal PATH
         text, _ = self.run_exec(command="echo $PATH")
         self.assertNotIn("/tmp/openwrt-mcp.", text)

@@ -104,19 +104,28 @@ mcp_log() { [ "$MCP_DEBUG" = 1 ] && printf 'openwrt-mcp: %s\n' "$*" >&2; return 
 
 # ---------------------------------------------------------------- trusted tools
 # A compromised router may have replaced applets in the overlay. Every tool call runs
-# with the busybox of the firmware image first in PATH when the image has one.
-# MCP_PATH_ORIG keeps the router's own PATH (the exec tool offers it).
+# with the busybox of the firmware image first in PATH when the image has one, and
+# with the image's jsonfilter when that works. The links are made with the image's own
+# ln (the overlay's may be replaced too). MCP_PATH_ORIG keeps the router's own PATH
+# (the exec tool offers it).
 # shellcheck disable=SC2034  # used by server/90-exec.sh
 MCP_PATH_ORIG=$PATH
 MCP_TRUSTED=no
+_mcp_ln() { "$MCP_ROM/bin/busybox" ln -s "$1" "$2" 2>/dev/null || ln -s "$1" "$2" 2>/dev/null; }
 if [ -x "$MCP_ROM/bin/busybox" ] && "$MCP_ROM/bin/busybox" true 2>/dev/null; then
 	mkdir "$MCP_TMP/bin"
 	for _a in $("$MCP_ROM/bin/busybox" --list 2>/dev/null); do
 		case $_a in */* | . | ..) continue ;; esac
-		ln -s "$MCP_ROM/bin/busybox" "$MCP_TMP/bin/$_a" 2>/dev/null
+		_mcp_ln "$MCP_ROM/bin/busybox" "$MCP_TMP/bin/$_a"
 	done
+	MCP_TRUSTED="yes ($MCP_ROM/bin/busybox"
+	if [ -x "$MCP_ROM/usr/bin/jsonfilter" ] &&
+		[ "$("$MCP_ROM/usr/bin/jsonfilter" -s '{"a":7}' -e @.a 2>/dev/null)" = 7 ]; then
+		_mcp_ln "$MCP_ROM/usr/bin/jsonfilter" "$MCP_TMP/bin/jsonfilter"
+		MCP_TRUSTED="$MCP_TRUSTED, $MCP_ROM/usr/bin/jsonfilter"
+	fi
+	MCP_TRUSTED="$MCP_TRUSTED)"
 	PATH="$MCP_TMP/bin:$PATH"
-	MCP_TRUSTED="yes ($MCP_ROM/bin/busybox)"
 fi
 export PATH
 

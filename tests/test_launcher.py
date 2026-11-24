@@ -73,7 +73,9 @@ class SSHContainer(Container):
         self.port = subprocess.run(["docker", "port", self.name, "22"], check=True, capture_output=True,
                                    text=True).stdout.split()[0].rsplit(":", 1)[1]
         self.put("/etc/dropbear/authorized_keys", (keydir / "id.pub").read_bytes())
-        self.sh("chmod 700 /etc/dropbear; chmod 600 /etc/dropbear/authorized_keys;"
+        # 21.02.7 ships empty host key files that dropbear chokes on; -R makes new ones
+        self.sh("rm -f /etc/dropbear/dropbear_*_host_key;"
+                "chmod 700 /etc/dropbear; chmod 600 /etc/dropbear/authorized_keys;"
                 r"sed -i 's|^root:[^:]*:|root:$1$abcdefgh$0123456789abcdefghijkl:|' /etc/shadow")
         subprocess.run(["docker", "exec", "-d", self.name, "/bin/sh", "-c",
                         "/usr/sbin/dropbear -F -E -R -p 22 2>/tmp/dropbear.log"], check=True)
