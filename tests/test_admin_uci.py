@@ -25,9 +25,16 @@ NETWORK = b"""config interface 'lan'
 
 INIT = b"""#!/bin/sh /etc/rc.common
 START=99
-start() { touch /tmp/zzmcp.on; echo started; echo "password=hunter2"; }
+start() { touch /tmp/zzmcp.on; uci set zzsvc.main.state=on; uci commit zzsvc; echo started; echo "password=hunter2"; }
 stop() { rm -f /tmp/zzmcp.on; echo stopped; }
-reload() { sleep 30; }
+reload() { sleep 4; touch /tmp/zzmcp.reloaded; }
+"""
+
+# a stand-in for ubus while a real ubusd provides the socket: procd "answers", every
+# call is logged
+FAKE_UBUS = b"""#!/bin/sh
+echo "$*" >> /tmp/ubus.log
+echo '{ }'
 """
 
 
@@ -36,8 +43,7 @@ class TestUciChange(OpenWrtTestCase):
         if not self.container:
             self.skipTest("needs a container")
         self.container.put("/etc/config/mcptest", FIXTURE)
-        self.sh("rm -rf /tmp/.uci /etc/glversion; [ -e /sbin/reload_config.off ] && "
-                "mv /sbin/reload_config.off /sbin/reload_config; :")
+        self.sh("chmod 644 /etc/config/mcptest; rm -rf /tmp/.uci /etc/glversion")
 
     def uc(self, changes, **kw):
         return self.tool("uci_change", env=ADMIN_ENV, package=kw.pop("package", "mcptest"),
@@ -63,6 +69,19 @@ class TestUciChange(OpenWrtTestCase):
         self.assertIn("  + mcptest.main.enabled='0'", text)
         self.assertIn("option enabled '0'", self.config())
         self.assertEqual(self.sh("uci -q changes mcptest; :"), "")
+        # the server's umask 077 does not reach the committed file
+        self.assertTrue(self.sh("ls -l /etc/config/mcptest").startswith("-rw-r--r--"))
+
+    @needs_container
+    def test_large_changes_array(self):
+        # about 150 kB of operations: more than one argv word may hold (128 kB)
+        changes = [{"op": "set", "path": f"main.o{i}", "value": "v" * 2500} for i in range(60)]
+        text, err = self.uc(changes, dry_run=True)
+        self.assertFalse(err, text)
+        self.assertIn("config mcptest: 0 removed, 60 added", text)
+        # long values are cut in the listing, not in the configuration
+        self.assertRegex(text, r"vvv\.\.\. \[25\d\d characters\]")
+        self.assertUnchanged()
 
     @needs_container
     def test_every_op(self):
@@ -206,6 +225,12 @@ class TestUciChange(OpenWrtTestCase):
         text, err = self.uc([{"op": "delete", "path": "@item[0]"}], confirm=True)
         self.assertFalse(err, text)
         self.assertNotIn("'one'", self.config())
+        # dhcp (addresses for every client) is risky too; the images have it
+        before = self.config("dhcp")
+        text, err = self.uc([{"op": "set", "path": "lan.leasetime", "value": "1h"}], package="dhcp")
+        self.assertTrue(err, text)
+        self.assertIn("risky change, not applied: package dhcp", text)
+        self.assertEqual(self.config("dhcp"), before)
 
     @needs_container
     def test_secrets_redacted(self):
@@ -223,16 +248,32 @@ class TestUciChange(OpenWrtTestCase):
         change = [{"op": "set", "path": "main.enabled", "value": "0"}]
         text, err = self.uc(change)
         self.assertFalse(err, text)
-        self.assertIn("reload_config  /sbin/reload_config", text)
         self.assertIn("procd/ubus     not running", text)
         self.assertIn("NOT APPLIED: the change is committed to /etc/config/mcptest", text)
-        self.sh("mv /sbin/reload_config /sbin/reload_config.off")
-        text, err = self.uc([{"op": "set", "path": "main.enabled", "value": "1"}])
-        self.assertFalse(err, text)
-        self.assertIn("reload_config  not available on this firmware", text)
-        text, err = self.uc(change, reload=False)
+        text, err = self.uc([{"op": "set", "path": "main.enabled", "value": "1"}], reload=False)
         self.assertFalse(err, text)
         self.assertIn("not reloaded (reload: false)", text)
+
+    @needs_container
+    def test_reload_only_this_package(self):
+        # a real ubusd for the socket, a logging stand-in for the ubus client; another
+        # package (dhcp) has a committed change that reload_config would apply as well
+        dhcp = self.config("dhcp").encode()
+        self.container.put("/usr/sbin/ubus", FAKE_UBUS)
+        self.sh("chmod 755 /usr/sbin/ubus; mkdir -p /var/run/ubus; (/sbin/ubusd >/dev/null 2>&1 &); "
+                "i=0; while [ ! -S /var/run/ubus/ubus.sock ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done; "
+                "/sbin/reload_config; uci set dhcp.lan.leasetime=2h; uci commit dhcp; rm -f /tmp/ubus.log")
+        try:
+            text, err = self.uc([{"op": "set", "path": "main.enabled", "value": "0"}])
+            self.assertFalse(err, text)
+            self.assertIn("procd/ubus     answering", text)
+            self.assertIn("config.change event for mcptest sent to procd", text)
+            events = [line for line in self.sh("cat /tmp/ubus.log").splitlines() if " event " in line]
+            self.assertEqual(events, ['call service event {"type":"config.change","data":{"package":"mcptest"}}'])
+        finally:
+            self.sh("rm -f /usr/sbin/ubus /tmp/ubus.log /var/run/config.md5; killall ubusd; "
+                    "rm -f /var/run/ubus/ubus.sock; :")
+            self.container.put("/etc/config/dhcp", dhcp)
 
     @needs_container
     def test_glinet_note(self):
@@ -250,10 +291,17 @@ class TestServiceControl(OpenWrtTestCase):
         if not self.container:
             self.skipTest("needs a container")
         self.container.put("/etc/init.d/zzmcp", INIT)
-        self.sh("chmod 755 /etc/init.d/zzmcp; rm -f /tmp/zzmcp.on /etc/rc.d/S99zzmcp")
+        self.container.put("/etc/config/zzsvc", b"config main 'main'\n")
+        self.sh("chmod 755 /etc/init.d/zzmcp; chmod 644 /etc/config/zzsvc; "
+                "rm -f /tmp/zzmcp.on /tmp/zzmcp.reloaded /etc/rc.d/S99zzmcp")
 
     def sc(self, service, action, **kw):
         return self.tool("service_control", env=ADMIN_ENV, service=service, action=action, **kw)
+
+    def wait_for(self, path, secs=20):
+        out = self.sh(f"i=0; while [ ! -e {path} ] && [ $i -lt {secs} ]; do sleep 1; i=$((i+1)); done; "
+                      f"ls {path} 2>/dev/null; :")
+        return out.strip() == path
 
     @needs_container
     def test_status_start_stop(self):
@@ -268,6 +316,13 @@ class TestServiceControl(OpenWrtTestCase):
         self.assertNotIn("hunter2", text)
         self.assertIn("[exit 0]", text)
         self.assertEqual(self.sh("ls /tmp/zzmcp.on"), "/tmp/zzmcp.on\n")
+        # the init script runs with umask 022, not the server's 077
+        self.assertTrue(self.sh("ls -l /tmp/zzmcp.on").startswith("-rw-r--r--"))
+        # what the init script wrote to uci is reported
+        self.assertIn("== Changes in /etc/config", text)
+        self.assertIn("config zzsvc: 0 removed, 1 added", text)
+        self.assertIn("  + zzsvc.main.state='on'", text)
+        self.assertTrue(self.sh("ls -l /etc/config/zzsvc").startswith("-rw-r--r--"))
         text, err = self.sc("zzmcp", "stop")
         self.assertFalse(err, text)
         self.assertIn("stopped", text)
@@ -300,11 +355,16 @@ class TestServiceControl(OpenWrtTestCase):
     def test_risky_and_refused(self):
         self.container.put("/etc/init.d/tailscale", INIT)
         self.sh("chmod 755 /etc/init.d/tailscale; touch /tmp/zzmcp.on")
-        text, err = self.sc("tailscale", "stop")
-        self.assertTrue(err, text)
-        self.assertIn("risky action, not run: stop of tailscale", text)
+        # every action but status needs confirm: stopping cuts access, starting exposes
+        for action in ("stop", "start", "enable", "reload"):
+            text, err = self.sc("tailscale", action)
+            self.assertTrue(err, text)
+            self.assertIn("risky action, not run: tailscale carries access", text)
         self.assertEqual(self.sh("ls /tmp/zzmcp.on"), "/tmp/zzmcp.on\n")
-        text, err = self.sc("tailscale", "start")
+        self.assertNotIn("tailscale", self.sh("ls /etc/rc.d"))
+        text, err = self.sc("tailscale", "status")
+        self.assertFalse(err, text)
+        text, err = self.sc("tailscale", "start", confirm=True)
         self.assertFalse(err, text)
         text, err = self.sc("tailscale", "stop", confirm=True)
         self.assertFalse(err, text)
@@ -320,12 +380,28 @@ class TestServiceControl(OpenWrtTestCase):
         self.assertIn("enabled  yes (/etc/rc.d/S10boot)", text)
 
     @needs_container
-    def test_timeout(self):
-        # timeout= of self.tool is the harness' own limit: send the argument directly
+    def test_timeout_leaves_the_action_running(self):
+        # reload sleeps 4 s, then writes its marker. timeout= of self.tool is the harness'
+        # own limit: send the argument directly
         text, err = self.session(ADMIN_ENV).call_tool(
             "service_control", {"service": "zzmcp", "action": "reload", "timeout": 1})
         self.assertTrue(err, text)
-        self.assertIn("[timeout after 1 s]", text)
+        self.assertIn("[still running after 1 s: the action goes on in the background and was NOT killed", text)
+        self.assertEqual(self.sh("ls /tmp/zzmcp.reloaded 2>/dev/null; :"), "")
+        self.assertTrue(self.wait_for("/tmp/zzmcp.reloaded"), "the action was killed with the call")
+        # the job removed its private directory once it was done
+        self.sh("sleep 1")
+        self.assertEqual(self.sh("ls -d /tmp/openwrt-mcp.*/svc.* 2>/dev/null; :"), "")
+
+    @needs_container
+    def test_session_end_does_not_kill_the_action(self):
+        s = self.new_session(ADMIN_ENV)
+        s.initialize()
+        text, err = s.call_tool("service_control", {"service": "zzmcp", "action": "reload", "timeout": 1})
+        self.assertIn("still running", text)
+        s.close()
+        self.assertEqual(self.sh("ls /tmp/zzmcp.reloaded 2>/dev/null; :"), "")
+        self.assertTrue(self.wait_for("/tmp/zzmcp.reloaded"), "the action was killed with the server")
 
 
 class TestAdminOff(OpenWrtTestCase):

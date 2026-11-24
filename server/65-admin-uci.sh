@@ -4,12 +4,16 @@
 # Handler variables are assigned by arg/arg_int (through eval), _rt_fired by run_timeout:
 # shellcheck disable=SC2154
 
-# Packages whose change can cut the owner off or expose the router: every uci_change on
-# them needs confirm. system needs it only for ttylogin (serial console login); any
-# delete of a whole section needs it in every package.
-_UC_RISKY_PKGS='network firewall wireless dropbear uhttpd nginx rpcd oui-httpd wan-access rtty glconfig tailscale zerotier'
-# Init scripts that carry access or the network: stop, restart and disable need confirm.
-_SV_RISKY='network firewall dropbear sshd uhttpd nginx rpcd ubus odhcpd dnsmasq gl-ngx-session wpad hostapd tailscale zerotier openvpn'
+# Packages whose change can cut the owner off or expose the router (network and
+# addresses, Wi-Fi, firewall, logins and web UIs, remote access, VPN, file sharing, port
+# mapping, GL cloud and mode): every uci_change on them needs confirm. system needs it
+# only for ttylogin (serial console login); any delete of a whole section needs it in
+# every package.
+_UC_RISKY_PKGS='network firewall wireless dhcp dropbear uhttpd nginx rpcd oui-httpd wan-access rtty glconfig gl-cloud gl_ddns tailscale zerotier wireguard wireguard_server openvpn ovpnserver mptun gl_s2s upnpd samba samba4 ksmbd nas'
+# Init scripts that carry access or the network, or open the router to the outside:
+# every action but status needs confirm (stopping cuts access, starting or enabling can
+# expose the router, reload and restart apply whatever configuration is committed).
+_SV_RISKY='network firewall dnsmasq odhcpd wpad hostapd ubus rpcd dropbear sshd uhttpd nginx gl-ngx-session rtty tailscale zerotier gl-cloud gl_cloud openvpn wireguard wgserver wireguard_server ovpnserver mptun miniupnpd samba4 smbd ksmbd vsftpd ttyd ddns gl_ddns'
 # Init scripts that only make sense at boot or shutdown: every action but status is refused.
 _SV_REFUSED='boot done umount sysfixtime'
 
@@ -97,9 +101,14 @@ _uc_diff() {
 	fi
 	printf 'config %s: %s removed, %s added\n' "$_uc_pkg" \
 		"$(wc -l <diff.rm | tr -d ' ')" "$(wc -l <diff.add | tr -d ' ')"
-	{ sed 's/^/  - /' diff.rm; sed 's/^/  + /' diff.add; } | awk -v max="$3" '
+	{ sed 's/^/  - /' diff.rm; sed 's/^/  + /' diff.add; } | _uc_cut | awk -v max="$3" '
 		NR <= max { print }
 		END { if (NR > max) printf "  ... %d more lines\n", NR - max }'
+}
+
+# _uc_cut: filter, lines over 500 characters cut there (long values would eat the output)
+_uc_cut() {
+	awk '{ if (length($0) > 500) print substr($0, 1, 500) "... [" length($0) " characters]"; else print }'
 }
 
 # _uc_procd: exit status 0 when procd answers on ubus (its "service" object)
@@ -108,7 +117,7 @@ _uc_procd() { lib_ubus service list '{"name":"-"}' >/dev/null; }
 # ============================================================== uci_change
 mcp_register_admin uci_change <<'EOF'
 {"name":"uci_change","title":"Change uci configuration",
-"description":"Changes the uci configuration of ONE package in /etc/config: applies a list of operations (set, delete, add_list, del_list, add), commits the package and asks procd to reload the services that depend on it (reload_config). Every operation is checked first on a private copy of the package; if one fails, nothing is changed. dry_run shows the lines that would change and touches nothing. The result lists the plan, what changed in /etc/config (redacted) and whether the change was applied. Refused while the package has uncommitted changes from someone else (uci changes). Risky, so only with confirm=true after the user agreed to exactly this call: any change to the packages network, firewall, wireless, dropbear, uhttpd, nginx, rpcd, oui-httpd, wan-access, rtty, glconfig, tailscale, zerotier (they can cut off access to the router or expose it), a change of system ttylogin, and every delete of a whole section. Read the package first with the uci tool. On GL.iNet firmware prefer glinet_api for GL-managed settings.",
+"description":"Changes the uci configuration of ONE package in /etc/config: applies a list of operations (set, delete, add_list, del_list, add), commits the package and asks procd to reload the services that watch this package (the config.change event for this package only; reload_config is not used because it would also apply other packages' committed but unapplied changes). Every operation is checked first on a private copy of the package; if one fails, nothing is changed. dry_run shows the lines that would change and touches nothing. The result lists the plan, what changed in /etc/config (redacted) and whether the change was applied. Refused while the package has uncommitted changes from someone else (uci changes). Risky, so only with confirm=true after the user agreed to exactly this call: any change to the packages network, firewall, wireless, dhcp, dropbear, uhttpd, nginx, rpcd, oui-httpd, wan-access, rtty, glconfig, gl-cloud, gl_ddns, tailscale, zerotier, wireguard, wireguard_server, openvpn, ovpnserver, mptun, gl_s2s, upnpd, samba, samba4, ksmbd, nas (they can cut off access to the router or expose it), a change of system ttylogin, and every delete of a whole section. Read the package first with the uci tool. On GL.iNet firmware prefer glinet_api for GL-managed settings.",
 "inputSchema":{"type":"object","properties":{
 "package":{"type":"string","description":"uci package, the file name in /etc/config (letters, digits, _ and -). It must exist."},
 "changes":{"type":"array","description":"Operations, applied in order. path is relative to the package: section or section.option; a section is a name or @type[N] (N may be negative: @rule[-1] is the last rule, also one added by an earlier add). Values are taken literally (no shell); newlines are refused. 1 to 100 operations.","minItems":1,"maxItems":100,
@@ -118,9 +127,9 @@ mcp_register_admin uci_change <<'EOF'
 "value":{"type":"string","description":"the value (set, add_list, del_list) or the section type (add)"}},
 "required":["op"],"additionalProperties":false}},
 "dry_run":{"type":"boolean","description":"true: only show what would change, on a copy of the package. Default false.","default":false},
-"reload":{"type":"boolean","description":"true: after the commit, let procd reload the services whose configuration changed (reload_config). false: commit only. Default true.","default":true},
+"reload":{"type":"boolean","description":"true: after the commit, send procd the config.change event for this package, so it reloads the services that watch it. false: commit only. Default true.","default":true},
 "confirm":{"type":"boolean","description":"Set true only after the user agreed to exactly this risky change. Default false.","default":false},
-"timeout":{"type":"integer","description":"Seconds for the reload step, 1 to 300. Default 30.","default":30,"minimum":1,"maximum":300}},
+"timeout":{"type":"integer","description":"Seconds for the reload step (the ubus event), 1 to 300. Default 30.","default":30,"minimum":1,"maximum":300}},
 "required":["package","changes"],"additionalProperties":false},
 "annotations":{"title":"Change uci configuration","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}
 EOF
@@ -142,8 +151,13 @@ tool_uci_change() {
 	arg_bool confirm false && _uc_confirm=1
 
 	# ---- validate every change before anything runs
+	# through a file: a large array does not fit into one argv word for jsonfilter -s
 	arg _uc_all changes ''
-	_uc_types=$(jsonfilter -s "$_uc_all" -t '@[*]' 2>/dev/null | sed 's/\\ / /g')
+	printf '%s' "$_uc_all" >changes.json
+	_uc_all=
+	[ "$(jsonfilter -i changes.json -t '@' 2>/dev/null)" = array ] ||
+		{ tool_error "changes could not be read as a JSON array (too large for jsonfilter?)"; return; }
+	_uc_types=$(jsonfilter -i changes.json -t '@[*]' 2>/dev/null | sed 's/\\ / /g')
 	_uc_n=0
 	for _uc_t in $_uc_types; do _uc_n=$((_uc_n + 1)); done
 	[ "$_uc_n" -ge 1 ] || { tool_error "changes must hold at least one operation"; return; }
@@ -154,12 +168,12 @@ tool_uci_change() {
 		_uc_i=$((_uc_i + 1))
 		_uc_e="change $_uc_i"
 		[ "$_uc_t" = object ] || { tool_error "$_uc_e must be an object, got $_uc_t"; return; }
-		_uc_o=$(jsonfilter -s "$_uc_all" -e "@[$((_uc_i - 1))]")
+		jsonfilter -i changes.json -e "@[$((_uc_i - 1))]" >op.json 2>/dev/null
 		# types and values in one go, as shell assignments jsonfilter quotes itself (the
 		# core reads requests the same way); values arrive exactly, line breaks included.
 		# Absent and null members stay unset.
 		unset _uc_top _uc_tp _uc_tv _uc_op _uc_p _uc_v
-		eval "$(jsonfilter -s "$_uc_o" -t '_uc_top=@.op' -t '_uc_tp=@.path' -t '_uc_tv=@.value' \
+		eval "$(jsonfilter -i op.json -t '_uc_top=@.op' -t '_uc_tp=@.path' -t '_uc_tv=@.value' \
 			-e '_uc_op=@.op' -e '_uc_p=@.path' -e '_uc_v=@.value' 2>/dev/null)"
 		_uc_known=0
 		for _uc_k in "${_uc_top-}" "${_uc_tp-}" "${_uc_tv-}"; do
@@ -170,7 +184,7 @@ tool_uci_change() {
 			*) tool_error "$_uc_e: op, path and value must be strings (quote numbers: \"1\")"; return ;;
 			esac
 		done
-		_uc_members=$(jsonfilter -s "$_uc_o" -t '@.*' 2>/dev/null | sed 's/\\ / /g' | wc -w)
+		_uc_members=$(jsonfilter -i op.json -t '@.*' 2>/dev/null | sed 's/\\ / /g' | wc -w)
 		[ "$_uc_members" -eq "$_uc_known" ] || { tool_error "$_uc_e: unknown or null member (an operation takes op, path and value only)"; return; }
 		_uc_op=${_uc_op-} _uc_p=${_uc_p-} _uc_v=${_uc_v-}
 		_uc_hasp=0
@@ -234,7 +248,7 @@ tool_uci_change() {
 
 	_uc_plan() {
 		section "Plan: $_uc_n operation(s) on /etc/config/$_uc_pkg"
-		redact <plan.v | awk 'NR == FNR { k[FNR] = $0; next } { print k[FNR] " " $0 }' plan.k -
+		redact <plan.v | awk 'NR == FNR { k[FNR] = $0; next } { print k[FNR] " " $0 }' plan.k - | _uc_cut
 	}
 
 	# ---- risky without confirm: refused, also before a dry run tells more
@@ -285,7 +299,9 @@ tool_uci_change() {
 		return 0
 	fi
 
-	# ---- the real run
+	# ---- the real run, with the usual umask: the server's 077 must not reach files uci
+	# writes, nor services procd reloads
+	umask 022
 	lib_cfg_snapshot snap
 	if ! _uc_ops uci >real.err; then
 		uci -q revert "$_uc_pkg" >/dev/null 2>&1
@@ -309,28 +325,21 @@ tool_uci_change() {
 	if [ "$_uc_reload" = 0 ]; then
 		echo "not reloaded (reload: false): the change is committed but the running services still use the old configuration"
 	else
-		_uc_rc=
-		have reload_config && _uc_rc=$(command -v reload_config)
+		# only this package: reload_config would also apply every other package whose
+		# committed configuration differs from what procd last applied
 		if ! _uc_procd; then
-			echo "reload_config  ${_uc_rc:-not available on this firmware}"
 			echo "procd/ubus     not running or not answering (no ubus socket, or procd's service object is missing)"
 			echo "result         NOT APPLIED: the change is committed to /etc/config/$_uc_pkg, but no service was reloaded. Apply it with service_control (action reload or restart) once procd runs, or reboot."
-		elif [ -n "$_uc_rc" ] && [ -f /var/run/config.md5 ]; then
-			run_timeout "$_uc_to" reload_config >reload.out 2>&1
-			_uc_x=$?
-			echo "reload_config  $_uc_rc"
-			if [ "$_uc_x" = 124 ] && [ "$_rt_fired" = 1 ]; then
-				echo "result         reload_config was stopped after $_uc_to s; the change is committed, check the services"
-			else
-				echo "result         ran (exit $_uc_x): procd reloads every service whose configuration changed since the last reload_config, in the background (usually within a few seconds)"
-			fi
-			[ -s reload.out ] && redact <reload.out | head -n 20 | sed 's/^/  /'
 		else
-			echo "reload_config  ${_uc_rc:-not available on this firmware}${_uc_rc:+ (no /var/run/config.md5 to compare against)}"
-			if lib_ubus service event "{\"type\":\"config.change\",\"data\":{\"package\":\"$_uc_pkg\"}}" >/dev/null; then
-				echo "result         sent procd the config.change event for $_uc_pkg: it reloads the services that watch this package, in the background"
+			run_timeout "$_uc_to" ubus call service event "{\"type\":\"config.change\",\"data\":{\"package\":\"$_uc_pkg\"}}" >event.out 2>&1
+			_uc_x=$?
+			echo "procd/ubus     answering"
+			if [ "$_uc_x" = 0 ]; then
+				echo "result         config.change event for $_uc_pkg sent to procd (ubus call service event): it reloads the services that watch this package, in the background (usually within a few seconds). reload_config was not used: it would also apply other packages' committed but unapplied changes."
+			elif [ "$_uc_x" = 124 ] && [ "$_rt_fired" = 1 ]; then
+				echo "result         NOT APPLIED: ubus did not answer within $_uc_to s; the change is committed to /etc/config/$_uc_pkg. Use service_control (action reload)."
 			else
-				echo "result         NOT APPLIED: the config.change event could not be sent; the change is committed to /etc/config/$_uc_pkg. Use service_control (action reload)."
+				echo "result         NOT APPLIED: the config.change event failed (exit $_uc_x: $(tr '\n' ' ' <event.out | cut -c 1-200)); the change is committed to /etc/config/$_uc_pkg. Use service_control (action reload)."
 			fi
 		fi
 	fi
@@ -348,12 +357,12 @@ _uc_glnote() {
 # ============================================================== service_control
 mcp_register_admin service_control <<'EOF'
 {"name":"service_control","title":"Control an init script",
-"description":"Runs an init script in /etc/init.d: status (enabled at boot? running instances in procd?, read only), or start, stop, restart, reload, enable, disable (runs /etc/init.d/NAME ACTION and returns its output and exit status, then the status). Risky, so only with confirm=true after the user agreed: stop, restart and disable of services that carry access or the network (network, firewall, dropbear, sshd, uhttpd, nginx, rpcd, ubus, odhcpd, dnsmasq, gl-ngx-session, wpad, hostapd, tailscale, zerotier, openvpn). boot, done, umount and sysfixtime run only at boot or shutdown: every action but status is refused for them. Use the services tool to list init scripts.",
+"description":"Runs an init script in /etc/init.d: status (enabled at boot? running instances in procd?, read only), or start, stop, restart, reload, enable, disable (runs /etc/init.d/NAME ACTION detached from the call, so a timeout never kills it halfway; returns its output and exit status, the status and what changed in /etc/config). Risky, so only with confirm=true after the user agreed: every action but status on a service that carries access or the network or opens the router to the outside (network, firewall, dnsmasq, odhcpd, wpad, hostapd, ubus, rpcd, dropbear, sshd, uhttpd, nginx, gl-ngx-session, rtty, tailscale, zerotier, gl-cloud, gl_cloud, openvpn, wireguard, wgserver, wireguard_server, ovpnserver, mptun, miniupnpd, samba4, smbd, ksmbd, vsftpd, ttyd, ddns, gl_ddns): stopping cuts access, starting or enabling can expose the router, reload and restart apply whatever configuration is committed. boot, done, umount and sysfixtime run only at boot or shutdown: every action but status is refused for them. Use the services tool to list init scripts.",
 "inputSchema":{"type":"object","properties":{
 "service":{"type":"string","description":"Name of a script in /etc/init.d (letters, digits, _ . -), no path."},
 "action":{"type":"string","enum":["status","start","stop","restart","reload","enable","disable"],"description":"status only reads; the others run the init script with that action."},
 "confirm":{"type":"boolean","description":"Set true only after the user agreed to exactly this risky action. Default false.","default":false},
-"timeout":{"type":"integer","description":"Seconds before the init script and every process it started in the foreground are killed, 1 to 300. Default 30.","default":30,"minimum":1,"maximum":300}},
+"timeout":{"type":"integer","description":"Seconds to wait for the init script, 1 to 300. Default 30. A script still running then is reported and left running, never killed.","default":30,"minimum":1,"maximum":300}},
 "required":["service","action"],"additionalProperties":false},
 "annotations":{"title":"Control an init script","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}
 EOF
@@ -406,31 +415,50 @@ tool_service_control() {
 		tool_error "refused: /etc/init.d/$_sv_name runs only at boot or shutdown (boot, done, umount, sysfixtime); running it by hand or changing its boot link can break the router"
 		return
 	fi
-	case $_sv_act in
-	stop | restart | disable)
-		if _uc_in "$_sv_name" "$_SV_RISKY" && [ "$_sv_confirm" = 0 ]; then
-			tool_error "risky action, not run: $_sv_act of $_sv_name can cut off access to the router or its network. Ask the user whether to run exactly this, and only then resend the same call with confirm: true."
-			return
-		fi
-		;;
-	esac
+	if _uc_in "$_sv_name" "$_SV_RISKY" && [ "$_sv_confirm" = 0 ]; then
+		tool_error "risky action, not run: $_sv_name carries access to the router or its network, or opens it to the outside; $_sv_act can cut off access or expose the router. Ask the user whether to run exactly this, and only then resend the same call with confirm: true."
+		return
+	fi
+
+	# the deadline counts from here, so the report after it fits into the call limit
+	# (timeout + 5 s)
+	_sv_end=$(($(date +%s) + _sv_to))
+	lib_cfg_snapshot snap
+	# The action runs detached from this call: orphaned (double fork), in its own
+	# session where setsid exists, without the call's tag, stdin /dev/null, umask 022,
+	# from /. Neither the call limit nor the end of the server can kill it halfway (a
+	# network restart stopped between stop and start would lock the owner out). Its
+	# output and exit status go to a private directory outside the work directory; the
+	# last of the two sides to finish with it (this handler or the job) removes it, and
+	# the server's exit removes it with $MCP_TMP.
+	_sv_d=$(mktemp -d "$MCP_TMP/svc.XXXXXX") || { tool_error "cannot create a directory in $MCP_TMP (is /tmp full?)"; return; }
+	_sv_set=
+	have setsid && _sv_set=setsid
+	(
+		unset MCP_CALL_TAG
+		umask 022
+		cd / || exit 1
+		# shellcheck disable=SC2016  # the inner script expands its own arguments
+		$_sv_set sh -c '"$2" "$3" </dev/null >"$1/out" 2>&1
+			echo $? >"$1/rc.tmp" && mv "$1/rc.tmp" "$1/rc"
+			mkdir "$1/one" 2>/dev/null || rm -rf "$1"' \
+			sh "$_sv_d" "/etc/init.d/$_sv_name" "$_sv_act" &
+	) </dev/null >/dev/null 2>&1
+	while [ ! -f "$_sv_d/rc" ] && [ "$(date +%s)" -lt "$_sv_end" ]; do sleep 1; done
 
 	section "/etc/init.d/$_sv_name $_sv_act"
-	# the script runs from /, without the call's tag: daemons it starts outside procd
-	# belong to the router, not to this call
-	# shellcheck disable=SC2016  # the inner script expands its own arguments
-	run_timeout "$_sv_to" sh -c 'unset MCP_CALL_TAG; cd / || exit 1; exec "$0" "$1"' \
-		"/etc/init.d/$_sv_name" "$_sv_act" >out 2>&1
-	_sv_rc=$?
-	redact <out | awk 'NR <= 200 { print } END { if (NR > 200) printf "... %d more lines\n", NR - 200 }'
-	if [ "$_sv_rc" = 124 ] && [ "$_rt_fired" = 1 ]; then
-		printf '[timeout after %s s]\n' "$_sv_to"
-		section "Status of $_sv_name"
-		_sv_status "$_sv_name"
-		return 1
+	redact <"$_sv_d/out" 2>/dev/null | awk 'NR <= 200 { print } END { if (NR > 200) printf "... %d more lines\n", NR - 200 }'
+	_sv_err=0
+	if [ -f "$_sv_d/rc" ]; then
+		printf '[exit %s]\n' "$(cat "$_sv_d/rc")"
+	else
+		printf '[still running after %s s: the action goes on in the background and was NOT killed; check the result with service_control status or logs]\n' "$_sv_to"
+		_sv_err=1
 	fi
-	printf '[exit %s]\n' "$_sv_rc"
+	mkdir "$_sv_d/one" 2>/dev/null || rm -rf "$_sv_d"
 	section "Status of $_sv_name"
 	_sv_status "$_sv_name"
-	return 0
+	section "Changes in /etc/config"
+	lib_cfg_changes snap 200
+	return "$_sv_err"
 }
