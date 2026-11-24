@@ -60,16 +60,42 @@ class TestNetwork(OpenWrtTestCase):
             cls.container.sh(f"cat > /etc/config/network <<'EOF'\n{NETWORK}\nEOF\n"
                              f"cat > /etc/config/wireless <<'EOF'\n{WIRELESS}\nEOF")
 
-    def test_all_sections(self):
+    def test_overview(self):
         text = self.tool_ok("network")
-        for head in ("== Interfaces and addresses", "== Device types, bridges and VLANs",
-                     "== netifd interfaces", "== IPv4 routes, all tables", "== IPv6 routes, all tables",
-                     "== Policy routing rules", "== Neighbours", "== Resolvers", "== dnsmasq settings",
-                     "== Hosts files", "== DHCPv4 leases", "== DHCPv6 leases", "== Wi-Fi status",
-                     "== Wi-Fi config", "== WireGuard", "== OpenVPN", "== Tailscale", "== ZeroTier",
-                     "== Tunnel devices"):
+        for head in ("== Interfaces (one line per device", "== netifd interfaces", "== Routes, main table",
+                     "== Neighbours (entries per device", "== DNS (details: section=dns)",
+                     "== DHCP (details: section=dhcp)", "== Wi-Fi (radios and SSIDs", "== VPN (details: section=vpn)"):
             self.assertIn(head, text)
+        self.assertIn("section=interfaces", text)
+        self.assertRegex(text, r"\nlo\s+\S+\s+.*127\.0\.0\.1/8")
+        self.assertNotIn("[output cut", text)
+        self.assertLess(len(text.encode()), 25000, "the overview must stay compact")
+
+    def test_each_section(self):
+        heads = {
+            "interfaces": ("== Interfaces and addresses", "== Device types, bridges and VLANs", "== netifd interfaces"),
+            "routes": ("== IPv4 routes, all tables", "== IPv6 routes, all tables", "== Policy routing rules"),
+            "neighbors": ("== Neighbours (ip neigh)",),
+            "dns": ("== Resolvers", "== dnsmasq settings", "== dnsmasq processes", "== Hosts files"),
+            "dhcp": ("== DHCPv4 leases", "== DHCPv6 leases", "== DHCP servers and static leases"),
+            "wifi": ("== Wi-Fi status (iwinfo)", "== Wi-Fi config", "== hostapd and wpa_supplicant processes"),
+            "vpn": ("== WireGuard", "== OpenVPN", "== Tailscale", "== ZeroTier", "== Tunnel devices"),
+        }
+        for sec, hs in heads.items():
+            text = self.tool_ok("network", section=sec)
+            for h in hs:
+                self.assertIn(h, text, sec)
+            self.assertNotIn("[output cut", text, sec)
+        text = self.tool_ok("network", section="interfaces")
         self.assertRegex(text, r"inet 127\.0\.0\.1/8")
+
+    def test_no_unmasked_secrets(self):
+        # target-safe: no secret-looking uci option may carry a value other than <redacted>
+        leak = re.compile(r"\.(key[0-9]?|password|private_key|preshared_key|sae_password|psk)='(?!<redacted>')")
+        for sec in ("all", "wifi", "vpn", "interfaces"):
+            text = self.tool_ok("network", section=sec)
+            self.assertIsNone(leak.search(text), f"{sec}: {leak.search(text)}")
+            self.assertNotRegex(text, r"private key: (?!\(hidden\))")
 
     def test_one_section_and_bad_section(self):
         text = self.tool_ok("network", section="routes")
@@ -90,11 +116,17 @@ class TestNetwork(OpenWrtTestCase):
 
     @needs_container
     def test_no_secrets(self):
+        for sec in ("all", "interfaces", "routes", "neighbors", "dns", "dhcp", "wifi", "vpn"):
+            text = self.tool_ok("network", section=sec)
+            for secret in (WIFI_KEY, WG_PRIVATE, WG_PSK, PPPOE_PASS):
+                self.assertNotIn(secret, text, sec)
         text = self.tool_ok("network")
-        for secret in (WIFI_KEY, WG_PRIVATE, WG_PSK, PPPOE_PASS):
-            self.assertNotIn(secret, text)
+        self.assertIn('ssid  default_radio0 device=radio0 mode=ap ssid="HomeNet" encryption=psk2', text)
+        self.assertIn("uci VPN interfaces: wg0(wireguard)", text)
+        text = self.tool_ok("network", section="wifi")
         self.assertIn("wireless.default_radio0.key='<redacted>'", text)
-        self.assertIn("uci interface wg0: listen_port=51820 addresses=10.0.0.1/24", text)
+        text = self.tool_ok("network", section="vpn")
+        self.assertIn("uci interface wg0 (proto wireguard): listen_port=51820 addresses=10.0.0.1/24", text)
         self.assertIn("peer peer1: description= endpoint=vpn.example.com:51820 allowed_ips=10.0.0.2/32", text)
 
     @needs_container
@@ -122,13 +154,16 @@ class TestNetwork(OpenWrtTestCase):
                    "conf-dir=/tmp/dnsmasq.d\ndomain-needed")
         write_file(self, "/tmp/hosts/extra", "198.51.100.77 bank.example.com")
         text = self.tool_ok("network", section="dns")
-        self.assertIn("/var/etc/dnsmasq.conf.cfg01411c (4 settings):", text)
+        self.assertRegex(text, r"/(var|tmp)/etc/dnsmasq\.conf\.cfg01411c \(4 settings\):")
+        self.assertEqual(text.count("address=/update.example.com/198.51.100.66"), 1, "each file once")
         self.assertIn("address=/update.example.com/198.51.100.66", text)
         self.assertIn("server=/corp.example/10.1.1.1", text)
         self.assertNotIn("domain-needed", text)
         self.assertIn("/tmp/hosts/extra (1 entries):", text)
         self.assertIn("198.51.100.77 bank.example.com", text)
         self.assertIn("domain=lan", text)
+        text = self.tool_ok("network")
+        self.assertEqual(text.count("address=/update.example.com/198.51.100.66"), 1)
 
 
 class TestConnections(OpenWrtTestCase):
@@ -198,11 +233,18 @@ class TestConnections(OpenWrtTestCase):
 class TestFirewall(OpenWrtTestCase):
     def test_summary(self):
         text = self.tool_ok("firewall")
-        for head in ("== Defaults", "== Zones", "== Forwardings", "== Rules accepting input from a WAN zone",
-                     "== All rules", "== Port forwards (redirects)", "== Includes (uci)",
-                     "== Custom rule files", "== UPnP / NAT-PMP", "== Active ruleset"):
+        heads = ("== Defaults", "== Zones", "== Forwardings", "== Rules accepting input from a WAN zone",
+                 "== Port forwards (redirects)", "== Includes (uci)", "== All rules", "== UPnP / NAT-PMP",
+                 "== Custom rule files", "== Active ruleset")
+        for head in heads:
             self.assertIn(head, text)
+        # what is exposed comes first, the long lists last
+        self.assertEqual([text.index(h) for h in heads], sorted(text.index(h) for h in heads))
         self.assertRegex(text, r"firewall: fw[34]")
+
+    @needs_container
+    def test_container_zones(self):
+        text = self.tool_ok("firewall")
         self.assertRegex(text, r"\nwan\s+REJECT\s+ACCEPT\s+(REJECT|DROP)\s+1\s+wan wan6")
         self.assertIn("lan -> wan", text)
         self.assertRegex(text, r"\nAllow-Ping\s+proto=icmp")
